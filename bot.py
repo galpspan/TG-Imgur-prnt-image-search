@@ -32,6 +32,7 @@ class ImageBot:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         ]
         self.sessions = {}
+        self.last_commands = {}  # Для хранения последних команд пользователей
 
     def generate_random_string(self, length: int) -> str:
         chars = string.ascii_letters + string.digits
@@ -110,7 +111,7 @@ class ImageBot:
         return await loop.run_in_executor(None, self.extract_prnt_image_url, code)
 
     async def show_main_menu(self, update: Update):
-        reply_keyboard = [["PRNT.SC", "IMGUR"], ["СТОП"]]
+        reply_keyboard = [["PRNT.SC", "IMGUR"], ["ПОВТОРИТЬ", "СТОП"]]
         await update.message.reply_text(
             "Выберите действие:",
             reply_markup=ReplyKeyboardMarkup(
@@ -131,6 +132,7 @@ class ImageBot:
 /getimg <5|7> <1-25> - поиск на Imgur
 /getprnt <1-25> - поиск на prnt.sc (длина всегда 6)
 /stop - остановить текущий поиск
+/repeat - повторить последний поиск
 
 Примеры:
 /getimg 5 10
@@ -178,6 +180,21 @@ class ImageBot:
             )
             await update.message.reply_text("❗️Нет активного поиска.")
 
+    async def repeat_last_command(self, update: Update, context: CallbackContext):
+        user_id = update.effective_user.id
+        last_command = self.last_commands.get(user_id)
+        
+        if not last_command:
+            await update.message.reply_text("❗️Нет предыдущей команды для повторения.")
+            return
+            
+        if last_command["type"] == "imgur":
+            context.args = [str(last_command["length"]), str(last_command["count"])]
+            await self.get_imgur_images(update, context)
+        elif last_command["type"] == "prnt":
+            context.args = [str(last_command["count"])]
+            await self.get_prnt_images(update, context)
+
     async def get_imgur_images(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
 
@@ -209,6 +226,14 @@ class ImageBot:
         if not 1 <= count <= 25:
             await update.message.reply_text("Можно запросить от 1 до 25 изображений за раз")
             return
+
+        # Сохраняем команду для возможного повторения
+        self.last_commands[user_id] = {
+            "type": "imgur",
+            "length": length,
+            "count": count,
+            "timestamp": time.time()
+        }
 
         start_time = time.time()
         analyzed = 0
@@ -343,6 +368,14 @@ class ImageBot:
         if not 1 <= count <= 25:
             await update.message.reply_text("Можно запросить от 1 до 25 изображений за раз")
             return
+
+        # Сохраняем команду для возможного повторения
+        self.last_commands[user_id] = {
+            "type": "prnt",
+            "length": 6,  # Фиксированная длина для prnt.sc
+            "count": count,
+            "timestamp": time.time()
+        }
 
         length = 6  # Фиксированная длина для prnt.sc
         start_time = time.time()
@@ -525,6 +558,9 @@ class ImageBot:
         elif text == "СТОП":
             await self.stop(update, context)
             await self.show_main_menu(update)
+            
+        elif text == "ПОВТОРИТЬ":
+            await self.repeat_last_command(update, context)
 
 
 def main():
@@ -536,6 +572,7 @@ def main():
     application.add_handler(CommandHandler("getimg", bot.get_imgur_images))
     application.add_handler(CommandHandler("getprnt", bot.get_prnt_images))
     application.add_handler(CommandHandler("stop", bot.stop))
+    application.add_handler(CommandHandler("repeat", bot.repeat_last_command))
     
     # Обработчик текстовых сообщений (для кнопок)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
