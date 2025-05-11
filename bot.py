@@ -33,6 +33,17 @@ class ImageBot:
         self.sessions = {}
         self.last_commands = {}  # Для хранения последних команд пользователей
 
+    def format_time(self, seconds: int) -> str:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        seconds = seconds % 60
+        if hours > 0:
+            return f"{hours}ч {minutes}м {seconds}с"
+        elif minutes > 0:
+            return f"{minutes}м {seconds}с"
+        else:
+            return f"{seconds}с"
+
     def generate_random_string(self, length: int) -> str:
         chars = string.ascii_letters + string.digits
         return "".join(random.choice(chars) for _ in range(length))
@@ -160,7 +171,7 @@ class ImageBot:
                 f"{service} Поиск пользователя {user_id} был отменён. "
                 f"Длина: {length}, количество: {count}, "
                 f"найдено: {found}, проверено: {analyzed}, "
-                f"время: {elapsed}с"
+                f"время: {self.format_time(elapsed)}"
             )
 
             await update.message.reply_text(
@@ -169,7 +180,7 @@ class ImageBot:
                 f"Длина: {length}\n"
                 f"Найдено: {found}/{count}\n"
                 f"Проверено: {analyzed}\n"
-                f"Время: {elapsed // 60}м {elapsed % 60}с"
+                f"Время: {self.format_time(elapsed)}"
             )
 
             del self.sessions[user_id]
@@ -248,7 +259,7 @@ class ImageBot:
             f"Цель: {count} изображений\n"
             f"Найдено: 0/{count}\n"
             f"Проверено: 0\n"
-            f"Время: 0м 0с"
+            f"Время: 0с"
         )
 
         async def update_status():
@@ -260,7 +271,7 @@ class ImageBot:
                 f"Цель: {count} изображений\n"
                 f"Найдено: {found}/{count}\n"
                 f"Проверено: {analyzed}\n"
-                f"Время: {elapsed // 60}м {elapsed % 60}с"
+                f"Время: {self.format_time(elapsed)}"
             )
 
         async def search_loop():
@@ -317,7 +328,7 @@ class ImageBot:
                     f"Imgur поиск пользователя {user_id} завершён. "
                     f"Длина: {length}, количество: {count}, "
                     f"найдено: {found}, проверено: {analyzed}, "
-                    f"время: {elapsed}с"
+                    f"время: {self.format_time(elapsed)}"
                 )
                 await update.message.reply_text(
                     f"✅ Поиск Imgur завершён\n"
@@ -325,7 +336,7 @@ class ImageBot:
                     f"Цель: {count} изображений\n"
                     f"Найдено: {found}/{count}\n"
                     f"Проверено: {analyzed}\n"
-                    f"Время: {elapsed // 60}м {elapsed % 60}с"
+                    f"Время: {self.format_time(elapsed)}"
                 )
                 del self.sessions[user_id]
 
@@ -391,7 +402,7 @@ class ImageBot:
             f"Цель: {count} изображений\n"
             f"Найдено: 0/{count}\n"
             f"Проверено: 0\n"
-            f"Время: 0м 0с"
+            f"Время: 0с"
         )
 
         async def update_status():
@@ -403,7 +414,7 @@ class ImageBot:
                 f"Цель: {count} изображений\n"
                 f"Найдено: {found}/{count}\n"
                 f"Проверено: {analyzed}\n"
-                f"Время: {elapsed // 60}м {elapsed % 60}с"
+                f"Время: {self.format_time(elapsed)}"
             )
 
         async def search_loop():
@@ -466,7 +477,7 @@ class ImageBot:
                     f"Prnt.sc поиск пользователя {user_id} завершён. "
                     f"Длина: {length}, количество: {count}, "
                     f"найдено: {found}, проверено: {analyzed}, "
-                    f"время: {elapsed}с"
+                    f"время: {self.format_time(elapsed)}"
                 )
                 await update.message.reply_text(
                     f"✅ Поиск prnt.sc завершён\n"
@@ -474,7 +485,7 @@ class ImageBot:
                     f"Цель: {count} изображений\n"
                     f"Найдено: {found}/{count}\n"
                     f"Проверено: {analyzed}\n"
-                    f"Время: {elapsed // 60}м {elapsed % 60}с"
+                    f"Время: {self.format_time(elapsed)}"
                 )
                 del self.sessions[user_id]
 
