@@ -23,7 +23,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 class ImageBot:
     def __init__(self):
         self.valid_extensions = [".jpg", ".jpeg", ".png", ".gif"]
@@ -129,8 +128,8 @@ class ImageBot:
 Привет! Я ищу случайные изображения с разных сервисов.
 
 Доступные команды:
-/getimg <5|7> <1-25> - поиск на Imgur
-/getprnt <1-25> - поиск на prnt.sc (длина всегда 6)
+/getimg <5|7> <1-50> - поиск на Imgur
+/getprnt <1-50> - поиск на prnt.sc (длина всегда 6)
 /stop - остановить текущий поиск
 /repeat - повторить последний поиск
 
@@ -209,7 +208,7 @@ class ImageBot:
 
         args = context.args
         if len(args) != 2:
-            await update.message.reply_text("Используйте: /getimg <5|7> <1-25>")
+            await update.message.reply_text("Используйте: /getimg <5|7> <1-50>")
             return
 
         try:
@@ -223,8 +222,8 @@ class ImageBot:
             await update.message.reply_text("Длина может быть только 5 или 7 символов")
             return
 
-        if not 1 <= count <= 25:
-            await update.message.reply_text("Можно запросить от 1 до 25 изображений за раз")
+        if not 1 <= count <= 50:
+            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
         # Сохраняем команду для возможного повторения
@@ -356,7 +355,7 @@ class ImageBot:
 
         args = context.args
         if len(args) != 1:
-            await update.message.reply_text("Используйте: /getprnt <1-25>")
+            await update.message.reply_text("Используйте: /getprnt <1-50>")
             return
 
         try:
@@ -365,8 +364,8 @@ class ImageBot:
             await update.message.reply_text("Количество должно быть числом")
             return
 
-        if not 1 <= count <= 25:
-            await update.message.reply_text("Можно запросить от 1 до 25 изображений за раз")
+        if not 1 <= count <= 50:
+            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
         # Сохраняем команду для возможного повторения
@@ -498,7 +497,7 @@ class ImageBot:
             reply_keyboard = [
                 ["1", "3", "5"],
                 ["10", "15", "25"],
-                ["НАЗАД"],
+                ["50", "НАЗАД"],
             ]
             await update.message.reply_text(
                 "PRNT.SC - Выберите количество:",
@@ -524,7 +523,7 @@ class ImageBot:
             reply_keyboard = [
                 ["1", "3", "5"],
                 ["10", "15", "25"],
-                ["НАЗАД"],
+                ["50", "НАЗАД"],
             ]
             await update.message.reply_text(
                 f"IMGUR - Выбран интервал {text}. Теперь выберите количество:",
@@ -535,7 +534,7 @@ class ImageBot:
             context.user_data["mode"] = "imgur_numbers"  # Переключаем в режим выбора чисел
 
         # Обработка выбора чисел (для обоих режимов)
-        elif text in ["1", "3", "5", "10", "15", "25"]:
+        elif text in ["1", "3", "5", "10", "15", "25", "50"]:
             if context.user_data.get("mode") == "imgur_numbers":
                 # Для IMGUR
                 interval = context.user_data["imgur_interval"]
@@ -562,25 +561,23 @@ class ImageBot:
         elif text == "ПОВТОРИТЬ":
             await self.repeat_last_command(update, context)
 
-
 def main():
     bot = ImageBot()
-    application = Application.builder().token("YOUR_BOT_TOKEN").build()
-    
+    application = Application.builder().token("8000139869:AAFt1avD7rZxZK-VwA5mZsTvAA_yaYZDH4Y").build()
+
     # Обработчики команд
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("getimg", bot.get_imgur_images))
     application.add_handler(CommandHandler("getprnt", bot.get_prnt_images))
     application.add_handler(CommandHandler("stop", bot.stop))
     application.add_handler(CommandHandler("repeat", bot.repeat_last_command))
-    
+
     # Обработчик текстовых сообщений (для кнопок)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    
+
     logger.info("Бот запущен и готов к работе")
     print("Бот запущен. Нажмите Ctrl+C для остановки")
     application.run_polling()
-
 
 if __name__ == "__main__":
     main()
