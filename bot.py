@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import logging
 import random
 import string
@@ -5,6 +6,7 @@ import time
 import asyncio
 import requests
 from bs4 import BeautifulSoup
+from typing import Union
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -31,7 +33,7 @@ class ImageBot:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         ]
         self.sessions = {}
-        self.last_commands = {}  # Для хранения последних команд пользователей
+        self.last_commands = {}
 
     def format_time(self, seconds: int) -> str:
         hours = seconds // 3600
@@ -48,8 +50,14 @@ class ImageBot:
         chars = string.ascii_letters + string.digits
         return "".join(random.choice(chars) for _ in range(length))
 
-    def check_image(self, url: str) -> str | None:
+    def check_image(self, url: str, source: str = "any") -> Union[str, None]:
         try:
+            # Проверка источника
+            if source == "prnt" and not any(d in url for d in ["prnt.sc", "prntscr.com"]):
+                return None
+            if source == "imgur" and "imgur.com" not in url:
+                return None
+
             headers = {"User-Agent": random.choice(self.user_agents)}
             head_response = requests.head(
                 url, headers=headers, timeout=5, allow_redirects=True
@@ -84,11 +92,11 @@ class ImageBot:
             logger.error(f"Ошибка при проверке {url}: {str(e)}")
             return None
 
-    async def check_image_async(self, url):
+    async def check_image_async(self, url, source="any"):
         loop = asyncio.get_event_loop()
-        return url, await loop.run_in_executor(None, self.check_image, url)
+        return url, await loop.run_in_executor(None, self.check_image, url, source)
 
-    def extract_prnt_image_url(self, code: str) -> str | None:
+    def extract_prnt_image_url(self, code: str) -> Union[str, None]:
         try:
             url = f"https://prnt.sc/{code}"
             headers = {"User-Agent": random.choice(self.user_agents)}
@@ -99,14 +107,16 @@ class ImageBot:
             img_tag = soup.find("img", {"class": "screenshot-image"})
             if img_tag and "src" in img_tag.attrs:
                 img_url = img_tag["src"]
+                
+                # Разрешаем только домены prnt.sc и связанные
+                if not any(d in img_url for d in ["prnt.sc", "prntscr.com", "lightshot.prntscr.com"]):
+                    return None
+                    
                 if img_url.startswith("//"):
                     img_url = f"https:{img_url}"
-                elif img_url.startswith("http"):
-                    pass
-                else:
+                elif not img_url.startswith("http"):
                     return None
 
-                # Проверяем, что это не placeholder изображение
                 if "prntscr.com/placeholder" in img_url:
                     return None
 
@@ -237,7 +247,6 @@ class ImageBot:
             await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
-        # Сохраняем команду для возможного повторения
         self.last_commands[user_id] = {
             "type": "imgur",
             "length": length,
@@ -281,7 +290,7 @@ class ImageBot:
                 for _ in range(10):
                     code = self.generate_random_string(length)
                     url = f"https://i.imgur.com/{code}.jpg"
-                    tasks.append(self.check_image_async(url))
+                    tasks.append(self.check_image_async(url, "imgur"))
 
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -379,15 +388,14 @@ class ImageBot:
             await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
-        # Сохраняем команду для возможного повторения
         self.last_commands[user_id] = {
             "type": "prnt",
-            "length": 6,  # Фиксированная длина для prnt.sc
+            "length": 6,
             "count": count,
             "timestamp": time.time()
         }
 
-        length = 6  # Фиксированная длина для prnt.sc
+        length = 6
         start_time = time.time()
         analyzed = 0
         found = 0
@@ -421,7 +429,7 @@ class ImageBot:
             nonlocal analyzed, found
             while found < count and not self.sessions[user_id]["stop"]:
                 tasks = []
-                for _ in range(5):  # Меньше параллельных запросов из-за парсинга страниц
+                for _ in range(5):
                     code = self.generate_random_string(length).lower()
                     tasks.append(self.extract_prnt_image_url_async(code))
 
@@ -440,9 +448,8 @@ class ImageBot:
                     self.sessions[user_id]["analyzed"] = analyzed
 
                     if img_url:
-                        # Проверяем само изображение
-                        ext = await self.check_image_async(img_url)
-                        if ext[1]:
+                        ext = await self.check_image_async(img_url, "prnt")
+                        if ext and ext[1]:
                             found += 1
                             self.sessions[user_id]["found"] = found
                             caption = f"({found}/{count}) prnt.sc: [{img_url.split('/')[-1].split('.')[0]}]({img_url})"
@@ -469,7 +476,7 @@ class ImageBot:
                     if analyzed % 5 == 0 or (img_url and found > 0):
                         await update_status()
 
-                await asyncio.sleep(0.5)  # Большая задержка из-за парсинга
+                await asyncio.sleep(0.5)
 
             if not self.sessions[user_id]["stop"]:
                 elapsed = int(time.time() - start_time)
@@ -516,7 +523,7 @@ class ImageBot:
                     reply_keyboard, resize_keyboard=True, is_persistent=True
                 ),
             )
-            context.user_data["mode"] = "prnt_sc"  # Сохраняем режим работы
+            context.user_data["mode"] = "prnt_sc"
 
         elif text == "IMGUR":
             reply_keyboard = [["5", "7"], ["НАЗАД"]]
@@ -526,11 +533,10 @@ class ImageBot:
                     reply_keyboard, resize_keyboard=True, is_persistent=True
                 ),
             )
-            context.user_data["mode"] = "imgur_interval"  # Режим выбора интервала
+            context.user_data["mode"] = "imgur_interval"
 
-        # Обработка выбора интервала для IMGUR (5 или 7)
         elif text in ["5", "7"] and context.user_data.get("mode") == "imgur_interval":
-            context.user_data["imgur_interval"] = text  # Сохраняем интервал
+            context.user_data["imgur_interval"] = text
             reply_keyboard = [
                 ["1", "3", "5"],
                 ["10", "15", "25"],
@@ -542,24 +548,19 @@ class ImageBot:
                     reply_keyboard, resize_keyboard=True, is_persistent=True
                 ),
             )
-            context.user_data["mode"] = "imgur_numbers"  # Переключаем в режим выбора чисел
+            context.user_data["mode"] = "imgur_numbers"
 
-        # Обработка выбора чисел (для обоих режимов)
         elif text in ["1", "3", "5", "10", "15", "25", "50"]:
             if context.user_data.get("mode") == "imgur_numbers":
-                # Для IMGUR
                 interval = context.user_data["imgur_interval"]
-                # Вызываем функцию поиска с параметрами из кнопок
                 context.args = [interval, text]
                 await self.get_imgur_images(update, context)
             else:
-                # Для PRNT.SC
-                # Вызываем функцию поиска с параметрами из кнопок
                 context.args = [text]
                 await self.get_prnt_images(update, context)
 
-            await self.show_main_menu(update)  # Возвращаем в главное меню
-            context.user_data.clear()  # Очищаем контекст
+            await self.show_main_menu(update)
+            context.user_data.clear()
 
         elif text == "НАЗАД":
             await self.show_main_menu(update)
@@ -575,7 +576,6 @@ class ImageBot:
 def main():
     bot = ImageBot()
     
-    # Чтение токена из файла
     try:
         with open("token.txt", "r") as f:
             token = f.read().strip()
@@ -592,14 +592,12 @@ def main():
 
     application = Application.builder().token(token).build()
 
-    # Обработчики команд
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("getimg", bot.get_imgur_images))
     application.add_handler(CommandHandler("getprnt", bot.get_prnt_images))
     application.add_handler(CommandHandler("stop", bot.stop))
     application.add_handler(CommandHandler("repeat", bot.repeat_last_command))
 
-    # Обработчик текстовых сообщений (для кнопок)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
 
     logger.info("Бот запущен и готов к работе")
