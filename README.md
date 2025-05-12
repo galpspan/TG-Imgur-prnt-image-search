@@ -21,11 +21,7 @@ pip install python-telegram-bot==20.3 requests==2.31.0 beautifulsoup4==4.12.2
 
 ### 2. Настройка бота  
 1. Получите токен бота у [@BotFather](https://t.me/BotFather)  
-2. В файле `bot.py` замените строку:  
-```python
-application = Application.builder().token("YOUR_BOT_TOKEN").build()
-```  
-на ваш токен (в кавычках).  
+2. В папке где находится `bot.py` создайте документ `token.txt` и введите туда свой токен просто текстом.
 
 ### 3. Запуск  
 ```bash
