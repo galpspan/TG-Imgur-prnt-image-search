@@ -574,7 +574,7 @@ class ImageBot:
 
 def main():
     bot = ImageBot()
-    application = Application.builder().token("8000139869:AAFt1avD7rZxZK-VwA5mZsTvAA_yaYZDH4Y").build()
+    application = Application.builder().token("YOUR_BOT_TOKEN").build()
 
     # Обработчики команд
     application.add_handler(CommandHandler("start", bot.start))
