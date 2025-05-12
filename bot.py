@@ -574,7 +574,23 @@ class ImageBot:
 
 def main():
     bot = ImageBot()
-    application = Application.builder().token("YOUR_BOT_TOKEN").build()
+    
+    # Чтение токена из файла
+    try:
+        with open("token.txt", "r") as f:
+            token = f.read().strip()
+    except FileNotFoundError:
+        logger.error("Файл token.txt не найден. Создайте файл с токеном бота.")
+        return
+    except Exception as e:
+        logger.error(f"Ошибка при чтении token.txt: {str(e)}")
+        return
+
+    if not token:
+        logger.error("Токен бота не найден в файле token.txt")
+        return
+
+    application = Application.builder().token(token).build()
 
     # Обработчики команд
     application.add_handler(CommandHandler("start", bot.start))
