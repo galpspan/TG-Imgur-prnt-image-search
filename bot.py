@@ -6,8 +6,8 @@ import time
 import asyncio
 import requests
 from bs4 import BeautifulSoup
-from typing import Union
-from telegram import Update, ReplyKeyboardMarkup
+from typing import Union, List, Dict, Set
+from telegram import Update, ReplyKeyboardMarkup, InputMediaPhoto, Message
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,6 +16,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.error import RetryAfter, BadRequest
 
 # Настройка логирования
 logging.basicConfig(
@@ -34,6 +35,13 @@ class ImageBot:
         ]
         self.sessions = {}
         self.last_commands = {}
+        self.media_groups = {}
+        self.sent_image_ids: Dict[int, Set[str]] = {}
+        self.sent_single_messages: Dict[int, Dict[str, Message]] = {}
+        self.max_group_size = 10
+        self.group_timeout = 30
+        self.search_timeout = 30
+        self.retry_attempts = 3
 
     def format_time(self, seconds: int) -> str:
         hours = seconds // 3600
@@ -52,23 +60,18 @@ class ImageBot:
 
     def check_image(self, url: str, source: str = "any") -> Union[str, None]:
         try:
-            # Проверка источника
             if source == "prnt" and not any(d in url for d in ["prnt.sc", "prntscr.com"]):
                 return None
             if source == "imgur" and "imgur.com" not in url:
                 return None
 
             headers = {"User-Agent": random.choice(self.user_agents)}
-            head_response = requests.head(
-                url, headers=headers, timeout=5, allow_redirects=True
-            )
+            head_response = requests.head(url, headers=headers, timeout=5, allow_redirects=True)
             if head_response.status_code != 200:
                 return None
 
             content_type = head_response.headers.get("content-type", "")
-            if not any(
-                ext in content_type for ext in ["image/jpeg", "image/png", "image/gif"]
-            ):
+            if not any(ext in content_type for ext in ["image/jpeg", "image/png", "image/gif"]):
                 return None
 
             get_response = requests.get(url, headers=headers, stream=True, timeout=5)
@@ -108,7 +111,6 @@ class ImageBot:
             if img_tag and "src" in img_tag.attrs:
                 img_url = img_tag["src"]
                 
-                # Разрешаем только домены prnt.sc и связанные
                 if not any(d in img_url for d in ["prnt.sc", "prntscr.com", "lightshot.prntscr.com"]):
                     return None
                     
@@ -129,6 +131,174 @@ class ImageBot:
     async def extract_prnt_image_url_async(self, code):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.extract_prnt_image_url, code)
+
+    def extract_image_id(self, caption: str) -> str:
+        if not caption:
+            return ""
+        try:
+            start = caption.find("[") + 1
+            end = caption.find("]")
+            return caption[start:end] if start > 0 and end > start else ""
+        except Exception:
+            return ""
+
+    async def cleanup_duplicate_singles(self, user_id: int, group_image_ids: Set[str]) -> int:
+        """Удаляет одиночные сообщения, которые есть в текущей группе"""
+        if user_id not in self.sent_single_messages:
+            return 0
+
+        deleted = 0
+        single_ids = list(self.sent_single_messages[user_id].keys())
+        
+        for image_id in single_ids:
+            if image_id in group_image_ids:
+                msg = self.sent_single_messages[user_id][image_id]
+                try:
+                    await msg.delete()
+                    del self.sent_single_messages[user_id][image_id]
+                    deleted += 1
+                    logger.info(f"Удалено дублирующееся одиночное сообщение {image_id} для пользователя {user_id}")
+                except Exception as e:
+                    logger.error(f"Ошибка при удалении сообщения {image_id}: {str(e)}")
+
+        return deleted
+
+    async def check_and_send_timeout(self, update: Update, user_id: int):
+        """Проверка таймаута с очисткой уже отправленных изображений"""
+        while not self.sessions.get(user_id, {}).get("stop", True):
+            await asyncio.sleep(1)
+            current_time = time.time()
+            
+            if (user_id in self.media_groups and self.media_groups[user_id] and 
+                current_time - self.sessions[user_id].get("last_found_time", 0) > self.group_timeout):
+                
+                # Фильтруем только новые изображения
+                new_media = []
+                for media in self.media_groups[user_id]:
+                    image_id = self.extract_image_id(media.caption)
+                    if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
+                        new_media.append(media)
+                
+                if new_media:
+                    logger.info(f"Таймаут достигнут, отправка {len(new_media)} новых изображений пользователю {user_id}")
+                    await self.send_media_group(update, new_media, user_id)
+                    self.sessions[user_id]["last_found_time"] = current_time
+                
+                # Полностью очищаем очередь после проверки
+                self.media_groups[user_id] = []
+
+    async def send_media_group(self, update: Update, media_group: List[InputMediaPhoto], user_id: int) -> bool:
+        attempts = 0
+        while attempts < self.retry_attempts:
+            try:
+                # Собираем все ID изображений в группе
+                group_image_ids = set()
+                for media in media_group:
+                    image_id = self.extract_image_id(media.caption)
+                    if image_id:
+                        group_image_ids.add(image_id)
+
+                # Удаляем дублирующиеся одиночные сообщения
+                await self.cleanup_duplicate_singles(user_id, group_image_ids)
+
+                # Отправляем группу
+                await update.message.reply_media_group(media=media_group)
+                logger.info(f"Пользователю {user_id} успешно отправлена группа из {len(media_group)} изображений")
+
+                # Обновляем список отправленных изображений
+                if user_id not in self.sent_image_ids:
+                    self.sent_image_ids[user_id] = set()
+                self.sent_image_ids[user_id].update(group_image_ids)
+
+                # Обновляем время последней отправки
+                if user_id in self.sessions:
+                    self.sessions[user_id]["last_found_time"] = time.time()
+
+                return True
+            except RetryAfter as e:
+                logger.warning(f"Rate limit exceeded для пользователя {user_id}. Waiting {e.retry_after} seconds")
+                await asyncio.sleep(e.retry_after)
+                attempts += 1
+            except Exception as e:
+                logger.error(f"Ошибка при отправке группы пользователю {user_id}: {str(e)}")
+                attempts += 1
+                await asyncio.sleep(1)
+        
+        logger.warning(f"Не удалось отправить группу пользователю {user_id} после {self.retry_attempts} попыток")
+        return False
+
+    async def send_single_media(self, update: Update, url: str, caption: str, is_gif: bool, user_id: int) -> bool:
+        try:
+            image_id = self.extract_image_id(caption)
+            
+            # Для GIF всегда разрешаем отправку
+            if not is_gif and image_id and user_id in self.sent_image_ids and image_id in self.sent_image_ids[user_id]:
+                logger.info(f"Изображение {image_id} уже было отправлено, пропускаем")
+                return True
+
+            if is_gif:
+                msg = await update.message.reply_animation(animation=url, caption=caption, parse_mode="Markdown")
+            else:
+                msg = await update.message.reply_photo(photo=url, caption=caption, parse_mode="Markdown")
+
+            if not is_gif and image_id:
+                if user_id not in self.sent_single_messages:
+                    self.sent_single_messages[user_id] = {}
+                self.sent_single_messages[user_id][image_id] = msg
+
+            if user_id not in self.sent_image_ids:
+                self.sent_image_ids[user_id] = set()
+            if image_id:
+                self.sent_image_ids[user_id].add(image_id)
+
+            logger.info(f"Пользователю {user_id} отправлено {'GIF' if is_gif else 'одиночное изображение'} {image_id}")
+            return True
+        except RetryAfter as e:
+            logger.warning(f"Rate limit exceeded для пользователя {user_id}. Waiting {e.retry_after} seconds")
+            await asyncio.sleep(e.retry_after)
+            return await self.send_single_media(update, url, caption, is_gif, user_id)
+        except Exception as e:
+            logger.error(f"Ошибка при отправке {'GIF' if is_gif else 'одиночного медиа'} пользователю {user_id}: {str(e)}")
+            return False
+
+    async def add_to_media_group(self, update: Update, user_id: int, url: str, ext: str, count: int, found: int, source: str):
+        image_id = url.split('/')[-1].split('.')[0]
+        display_url = f"[{image_id}]({url})"
+        
+        # Увеличиваем счетчик только для уникальных изображений
+        if image_id and (user_id not in self.sent_image_ids or image_id not in self.sent_image_ids[user_id]):
+            actual_found = self.sessions[user_id].get("actual_found", 0) + 1
+            self.sessions[user_id]["actual_found"] = actual_found
+            caption = f"({actual_found}/{count}) {display_url}"
+        else:
+            caption = f"(дубликат) {display_url}"
+            return  # Пропускаем дубликаты
+        
+        if ext == "gif":
+            await self.send_single_media(update, url, caption, True, user_id)
+            return
+        
+        if user_id not in self.media_groups:
+            self.media_groups[user_id] = []
+        
+        media_item = InputMediaPhoto(media=url, caption=caption, parse_mode="Markdown")
+        self.media_groups[user_id].append(media_item)
+        
+        if len(self.media_groups[user_id]) >= self.max_group_size:
+            if not await self.send_media_group(update, self.media_groups[user_id], user_id):
+                for media in self.media_groups[user_id]:
+                    try:
+                        await self.send_single_media(
+                            update,
+                            media.media,
+                            media.caption,
+                            False,
+                            user_id
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка при отправке одиночного изображения: {str(e)}")
+            
+            self.media_groups[user_id] = []
 
     async def show_main_menu(self, update: Update):
         reply_keyboard = [["PRNT.SC", "IMGUR"], ["ПОВТОРИТЬ", "СТОП"]]
@@ -164,41 +334,57 @@ class ImageBot:
 
     async def stop(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
-        session = self.sessions.get(user_id)
+        if user_id not in self.sessions:
+            await update.message.reply_text("❗️ Нет активного поиска.")
+            return
 
-        if session and session.get("task"):
-            session["stop"] = True
-            session["task"].cancel()
+        session = self.sessions[user_id]
+        session["stop"] = True
 
-            elapsed = int(time.time() - session.get("start_time", time.time()))
-            found = session.get("found", 0)
-            analyzed = session.get("analyzed", 0)
-            length = session.get("length", 0)
-            count = session.get("count", 0)
-            service = "prnt.sc" if length == 6 else "imgur"
+        # Отправка оставшихся изображений
+        if user_id in self.media_groups and self.media_groups[user_id]:
+            # Фильтруем только новые изображения
+            new_media = []
+            for media in self.media_groups[user_id]:
+                image_id = self.extract_image_id(media.caption)
+                if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
+                    new_media.append(media)
+            
+            if new_media:
+                await self.send_media_group(update, new_media, user_id)
 
-            logger.info(
-                f"{service} Поиск пользователя {user_id} был отменён. "
-                f"Длина: {length}, количество: {count}, "
-                f"найдено: {found}, проверено: {analyzed}, "
-                f"время: {self.format_time(elapsed)}"
-            )
+        # Получаем точную статистику
+        elapsed = int(time.time() - session.get("start_time", time.time()))
+        actual_found = session.get("actual_found", 0)
+        analyzed = session.get("analyzed", 0)
+        count = session.get("count", 0)
+        service = "prnt.sc" if session.get("length", 0) == 6 else "imgur"
 
-            await update.message.reply_text(
-                f"⛔️ Поиск остановлен.\n"
-                f"Сервис: {service}\n"
-                f"Длина: {length}\n"
-                f"Найдено: {found}/{count}\n"
-                f"Проверено: {analyzed}\n"
-                f"Время: {self.format_time(elapsed)}"
-            )
+        await update.message.reply_text(
+            f"✅ Поиск завершен\n"
+            f"Сервис: {service}\n"
+            f"Найдено уникальных: {actual_found}/{count}\n"
+            f"Проверено: {analyzed}\n"
+            f"Время: {self.format_time(elapsed)}"
+        )
+        
+        self.cleanup_user_session(user_id)
 
+    def cleanup_user_session(self, user_id: int):
+        """Полная очистка всех данных сессии пользователя"""
+        if user_id in self.sessions:
+            if self.sessions[user_id].get("task"):
+                self.sessions[user_id]["task"].cancel()
             del self.sessions[user_id]
-        else:
-            logger.info(
-                f"Пользователь {user_id} попытался использовать /stop, но поиск не был начат."
-            )
-            await update.message.reply_text("❗️Нет активного поиска.")
+        
+        if user_id in self.media_groups:
+            del self.media_groups[user_id]
+        
+        if user_id in self.sent_single_messages:
+            del self.sent_single_messages[user_id]
+        
+        if user_id in self.sent_image_ids:
+            del self.sent_image_ids[user_id]
 
     async def repeat_last_command(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
@@ -223,9 +409,6 @@ class ImageBot:
             if prev_session.get("task"):
                 prev_session["stop"] = True
                 prev_session["task"].cancel()
-                logger.info(
-                    f"Предыдущий поиск пользователя {user_id} был отменён перед началом нового"
-                )
 
         args = context.args
         if len(args) != 2:
@@ -257,10 +440,10 @@ class ImageBot:
         start_time = time.time()
         analyzed = 0
         found = 0
+        last_found_time = time.time()
+        last_status_update = 0
 
-        logger.info(
-            f"Imgur поиск пользователя {user_id} начат. Длина: {length}, количество: {count}"
-        )
+        logger.info(f"Imgur поиск пользователя {user_id} начат. Длина: {length}, количество: {count}")
 
         status_msg = await update.message.reply_text(
             f"🔍 Поиск Imgur начат\n"
@@ -272,82 +455,113 @@ class ImageBot:
         )
 
         async def update_status():
-            nonlocal analyzed, found
-            elapsed = int(time.time() - start_time)
-            await status_msg.edit_text(
-                f"🔍 Поиск Imgur\n"
-                f"Длина: {length}\n"
-                f"Цель: {count} изображений\n"
-                f"Найдено: {found}/{count}\n"
-                f"Проверено: {analyzed}\n"
-                f"Время: {self.format_time(elapsed)}"
-            )
-
-        async def search_loop():
-            nonlocal analyzed, found
-            while found < count and not self.sessions[user_id]["stop"]:
-                tasks = []
-                for _ in range(10):
-                    code = self.generate_random_string(length)
-                    url = f"https://i.imgur.com/{code}.jpg"
-                    tasks.append(self.check_image_async(url, "imgur"))
-
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                for result in results:
-                    if self.sessions[user_id]["stop"]:
-                        return
-
-                    if isinstance(result, Exception):
-                        logger.error(f"Ошибка при проверке изображения: {str(result)}")
-                        continue
-
-                    url, ext = result
-                    analyzed += 1
-                    self.sessions[user_id]["analyzed"] = analyzed
-
-                    if ext:
-                        found += 1
-                        self.sessions[user_id]["found"] = found
-                        caption = f"({found}/{count}) Imgur: [{url.split('/')[-1].split('.')[0]}]({url})"
-                        try:
-                            if ext == "gif":
-                                await update.message.reply_animation(
-                                    animation=url, caption=caption, parse_mode="Markdown"
-                                )
-                            else:
-                                await update.message.reply_photo(
-                                    photo=url, caption=caption, parse_mode="Markdown"
-                                )
-                            await update_status()
-                            await asyncio.sleep(1)
-                        except Exception as e:
-                            logger.error(f"Ошибка при отправке изображения: {str(e)}")
-                            found -= 1
-                            self.sessions[user_id]["found"] = found
-
-                    if analyzed % 10 == 0 or (ext and found > 0):
-                        await update_status()
-
-                await asyncio.sleep(0.1)
-
-            if not self.sessions[user_id]["stop"]:
-                elapsed = int(time.time() - start_time)
-                logger.info(
-                    f"Imgur поиск пользователя {user_id} завершён. "
-                    f"Длина: {length}, количество: {count}, "
-                    f"найдено: {found}, проверено: {analyzed}, "
-                    f"время: {self.format_time(elapsed)}"
-                )
-                await update.message.reply_text(
-                    f"✅ Поиск Imgur завершён\n"
+            nonlocal last_status_update
+            current_time = time.time()
+            if current_time - last_status_update >= 1:
+                elapsed = int(current_time - start_time)
+                await status_msg.edit_text(
+                    f"🔍 Поиск Imgur\n"
                     f"Длина: {length}\n"
                     f"Цель: {count} изображений\n"
                     f"Найдено: {found}/{count}\n"
                     f"Проверено: {analyzed}\n"
                     f"Время: {self.format_time(elapsed)}"
                 )
-                del self.sessions[user_id]
+                last_status_update = current_time
+
+        async def search_loop():
+            nonlocal analyzed, found, last_found_time
+            timeout_task = None
+            
+            try:
+                # Инициализация счетчиков
+                self.sessions[user_id]["actual_found"] = 0
+                self.sessions[user_id]["last_found_time"] = time.time()
+                
+                # Запускаем проверку таймаута
+                timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
+                
+                while found < count and not self.sessions[user_id]["stop"]:
+                    tasks = []
+                    for _ in range(10):
+                        code = self.generate_random_string(length)
+                        url = f"https://i.imgur.com/{code}.jpg"
+                        tasks.append(self.check_image_async(url, "imgur"))
+
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for result in results:
+                        if self.sessions[user_id]["stop"]:
+                            break
+
+                        if isinstance(result, Exception):
+                            continue
+
+                        url, ext = result
+                        analyzed += 1
+                        self.sessions[user_id]["analyzed"] = analyzed
+
+                        if ext:
+                            found += 1
+                            last_found_time = time.time()
+                            self.sessions[user_id]["found"] = found
+                            self.sessions[user_id]["last_found_time"] = last_found_time
+
+                            await self.add_to_media_group(
+                                update, user_id, url, ext, count, found, "imgur"
+                            )
+                            
+                            await update_status()
+                            await asyncio.sleep(1)
+
+                        if analyzed % 10 == 0 or (ext and found > 0):
+                            await update_status()
+
+                    await asyncio.sleep(0.1)
+                    
+            except asyncio.CancelledError:
+                logger.info(f"Поиск Imgur для пользователя {user_id} отменён")
+            except Exception as e:
+                logger.error(f"Ошибка в поиске Imgur для пользователя {user_id}: {str(e)}")
+            finally:
+                if timeout_task:
+                    timeout_task.cancel()
+                    try:
+                        await timeout_task
+                    except:
+                        pass
+                
+                # Гарантированная отправка оставшихся изображений
+                if user_id in self.media_groups and self.media_groups[user_id]:
+                    # Фильтруем только новые изображения
+                    new_media = []
+                    for media in self.media_groups[user_id]:
+                        image_id = self.extract_image_id(media.caption)
+                        if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
+                            new_media.append(media)
+                    
+                    if new_media:
+                        logger.info(f"Финальная отправка {len(new_media)} изображений пользователю {user_id}")
+                        await self.send_media_group(update, new_media, user_id)
+
+                elapsed = int(time.time() - start_time)
+                actual_found = self.sessions[user_id].get("actual_found", 0)
+                logger.info(
+                    f"Imgur поиск пользователя {user_id} завершён. "
+                    f"Длина: {length}, количество: {count}, "
+                    f"найдено: {actual_found}, проверено: {analyzed}, "
+                    f"время: {self.format_time(elapsed)}"
+                )
+                await update.message.reply_text(
+                    f"✅ Поиск Imgur завершён\n"
+                    f"Длина: {length}\n"
+                    f"Цель: {count} изображений\n"
+                    f"Найдено уникальных: {actual_found}/{count}\n"
+                    f"Проверено: {analyzed}\n"
+                    f"Время: {self.format_time(elapsed)}"
+                )
+                
+                self.cleanup_user_session(user_id)
 
         task = asyncio.create_task(search_loop())
         self.sessions[user_id] = {
@@ -359,6 +573,8 @@ class ImageBot:
             "length": length,
             "count": count,
             "status_msg": status_msg,
+            "actual_found": 0,
+            "last_found_time": time.time()
         }
 
     async def get_prnt_images(self, update: Update, context: CallbackContext):
@@ -369,9 +585,6 @@ class ImageBot:
             if prev_session.get("task"):
                 prev_session["stop"] = True
                 prev_session["task"].cancel()
-                logger.info(
-                    f"Предыдущий поиск пользователя {user_id} был отменён перед началом нового"
-                )
 
         args = context.args
         if len(args) != 1:
@@ -399,10 +612,10 @@ class ImageBot:
         start_time = time.time()
         analyzed = 0
         found = 0
+        last_found_time = time.time()
+        last_status_update = 0
 
-        logger.info(
-            f"Prnt.sc поиск пользователя {user_id} начат. Длина: {length}, количество: {count}"
-        )
+        logger.info(f"Prnt.sc поиск пользователя {user_id} начат. Количество: {count}")
 
         status_msg = await update.message.reply_text(
             f"🔍 Поиск prnt.sc начат\n"
@@ -414,87 +627,114 @@ class ImageBot:
         )
 
         async def update_status():
-            nonlocal analyzed, found
-            elapsed = int(time.time() - start_time)
-            await status_msg.edit_text(
-                f"🔍 Поиск prnt.sc\n"
-                f"Длина: {length}\n"
-                f"Цель: {count} изображений\n"
-                f"Найдено: {found}/{count}\n"
-                f"Проверено: {analyzed}\n"
-                f"Время: {self.format_time(elapsed)}"
-            )
-
-        async def search_loop():
-            nonlocal analyzed, found
-            while found < count and not self.sessions[user_id]["stop"]:
-                tasks = []
-                for _ in range(5):
-                    code = self.generate_random_string(length).lower()
-                    tasks.append(self.extract_prnt_image_url_async(code))
-
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                for result in results:
-                    if self.sessions[user_id]["stop"]:
-                        return
-
-                    if isinstance(result, Exception):
-                        logger.error(f"Ошибка при проверке prnt.sc: {str(result)}")
-                        continue
-
-                    img_url = result
-                    analyzed += 1
-                    self.sessions[user_id]["analyzed"] = analyzed
-
-                    if img_url:
-                        ext = await self.check_image_async(img_url, "prnt")
-                        if ext and ext[1]:
-                            found += 1
-                            self.sessions[user_id]["found"] = found
-                            caption = f"({found}/{count}) prnt.sc: [{img_url.split('/')[-1].split('.')[0]}]({img_url})"
-                            try:
-                                if ext[1] == "gif":
-                                    await update.message.reply_animation(
-                                        animation=img_url,
-                                        caption=caption,
-                                        parse_mode="Markdown",
-                                    )
-                                else:
-                                    await update.message.reply_photo(
-                                        photo=img_url,
-                                        caption=caption,
-                                        parse_mode="Markdown",
-                                    )
-                                await update_status()
-                                await asyncio.sleep(1)
-                            except Exception as e:
-                                logger.error(f"Ошибка при отправке изображения: {str(e)}")
-                                found -= 1
-                                self.sessions[user_id]["found"] = found
-
-                    if analyzed % 5 == 0 or (img_url and found > 0):
-                        await update_status()
-
-                await asyncio.sleep(0.5)
-
-            if not self.sessions[user_id]["stop"]:
-                elapsed = int(time.time() - start_time)
-                logger.info(
-                    f"Prnt.sc поиск пользователя {user_id} завершён. "
-                    f"Длина: {length}, количество: {count}, "
-                    f"найдено: {found}, проверено: {analyzed}, "
-                    f"время: {self.format_time(elapsed)}"
-                )
-                await update.message.reply_text(
-                    f"✅ Поиск prnt.sc завершён\n"
+            nonlocal last_status_update
+            current_time = time.time()
+            if current_time - last_status_update >= 1:
+                elapsed = int(current_time - start_time)
+                await status_msg.edit_text(
+                    f"🔍 Поиск prnt.sc\n"
                     f"Длина: {length}\n"
                     f"Цель: {count} изображений\n"
                     f"Найдено: {found}/{count}\n"
                     f"Проверено: {analyzed}\n"
                     f"Время: {self.format_time(elapsed)}"
                 )
-                del self.sessions[user_id]
+                last_status_update = current_time
+
+        async def search_loop():
+            nonlocal analyzed, found, last_found_time
+            timeout_task = None
+            
+            try:
+                # Инициализация счетчиков
+                self.sessions[user_id]["actual_found"] = 0
+                self.sessions[user_id]["last_found_time"] = time.time()
+                
+                # Запускаем проверку таймаута
+                timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
+                
+                while found < count and not self.sessions[user_id]["stop"]:
+                    tasks = []
+                    for _ in range(5):
+                        code = self.generate_random_string(length).lower()
+                        tasks.append(self.extract_prnt_image_url_async(code))
+
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for result in results:
+                        if self.sessions[user_id]["stop"]:
+                            break
+
+                        if isinstance(result, Exception):
+                            continue
+
+                        img_url = result
+                        analyzed += 1
+                        self.sessions[user_id]["analyzed"] = analyzed
+
+                        if img_url:
+                            ext = await self.check_image_async(img_url, "prnt")
+                            if ext and ext[1]:
+                                found += 1
+                                last_found_time = time.time()
+                                self.sessions[user_id]["found"] = found
+                                self.sessions[user_id]["last_found_time"] = last_found_time
+
+                                await self.add_to_media_group(
+                                    update, user_id, img_url, ext[1], count, found, "prnt"
+                                )
+                                
+                                await update_status()
+                                await asyncio.sleep(1)
+
+                        if analyzed % 5 == 0 or (img_url and found > 0):
+                            await update_status()
+
+                    await asyncio.sleep(0.5)
+                    
+            except asyncio.CancelledError:
+                logger.info(f"Поиск prnt.sc для пользователя {user_id} отменён")
+            except Exception as e:
+                logger.error(f"Ошибка в поиске prnt.sc для пользователя {user_id}: {str(e)}")
+            finally:
+                if timeout_task:
+                    timeout_task.cancel()
+                    try:
+                        await timeout_task
+                    except:
+                        pass
+                
+                # Гарантированная отправка оставшихся изображений
+                if user_id in self.media_groups and self.media_groups[user_id]:
+                    # Фильтруем только новые изображения
+                    new_media = []
+                    for media in self.media_groups[user_id]:
+                        image_id = self.extract_image_id(media.caption)
+                        if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
+                            new_media.append(media)
+                    
+                    if new_media:
+                        logger.info(f"Финальная отправка {len(new_media)} изображений пользователю {user_id}")
+                        await self.send_media_group(update, new_media, user_id)
+
+                elapsed = int(time.time() - start_time)
+                actual_found = self.sessions[user_id].get("actual_found", 0)
+                logger.info(
+                    f"Prnt.sc поиск пользователя {user_id} завершён. "
+                    f"Количество: {count}, "
+                    f"найдено: {actual_found}, проверено: {analyzed}, "
+                    f"время: {self.format_time(elapsed)}"
+                )
+                await update.message.reply_text(
+                    f"✅ Поиск prnt.sc завершён\n"
+                    f"Длина: {length}\n"
+                    f"Цель: {count} изображений\n"
+                    f"Найдено уникальных: {actual_found}/{count}\n"
+                    f"Проверено: {analyzed}\n"
+                    f"Время: {self.format_time(elapsed)}"
+                )
+                
+                self.cleanup_user_session(user_id)
 
         task = asyncio.create_task(search_loop())
         self.sessions[user_id] = {
@@ -506,6 +746,8 @@ class ImageBot:
             "length": length,
             "count": count,
             "status_msg": status_msg,
+            "actual_found": 0,
+            "last_found_time": time.time()
         }
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
