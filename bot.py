@@ -35,8 +35,8 @@ class ImageBot:
         self.sessions = {}
         self.last_commands = {}
         self.media_groups = {}
-        self.sent_image_ids: Dict[int, Set[str]] = {}
-        self.sent_single_messages: Dict[int, Dict[str, Message]] = {}
+        self.sent_image_ids = {}
+        self.sent_single_messages = {}
         self.max_group_size = 10
         self.group_timeout = 30
         self.search_timeout = 30
