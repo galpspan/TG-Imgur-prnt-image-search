@@ -25,7 +25,6 @@ logging.basicConfig(
     handlers=[logging.FileHandler("image_bot.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
-
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 class ImageBot:
@@ -95,11 +94,17 @@ class ImageBot:
             return None
         except Exception as e:
             logger.error(f"Ошибка при проверке {url}: {str(e)}")
+            if "Flood control exceeded" in str(e) and "Retry in " in str(e):
+                raise Exception(str(e))
             return None
 
     async def check_image_async(self, url, source="any"):
         loop = asyncio.get_event_loop()
-        return url, await loop.run_in_executor(None, self.check_image, url, source)
+        try:
+            ext = await loop.run_in_executor(None, self.check_image, url, source)
+            return url, ext
+        except Exception as e:
+            return e
 
     def extract_prnt_image_url(self, code: str) -> Union[str, None]:
         try:
@@ -371,6 +376,17 @@ class ImageBot:
             context.args = [str(last_command["count"])]
             await self.get_prnt_images(update, context)
 
+    async def handle_flood_control(self, update, msg):
+        try:
+            retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
+            logger.warning(f"Flood control: ожидание {retry_in} секунд")
+            await update.message.reply_text(
+                f"Flood control! Ждём {retry_in} секунд, чтобы продолжить поиск..."
+            )
+            await asyncio.sleep(retry_in)
+        except Exception as e:
+            logger.error(f"Ошибка обработки Flood Control: {e}")
+
     async def get_imgur_images(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
 
@@ -394,7 +410,6 @@ class ImageBot:
             await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
-        # Проверка идентичного поиска
         last_command = self.last_commands.get(user_id)
         active_session = self.sessions.get(user_id)
         if (
@@ -462,81 +477,92 @@ class ImageBot:
         async def search_loop():
             nonlocal analyzed, found, last_found_time
             timeout_task = None
-            try:
-                session = self.sessions.get(user_id)
-                if not session:
-                    return
-                session["actual_found"] = 0
-                session["_real_sent_ids"] = set()
-                session["last_found_time"] = time.time()
-                timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
-                while session.get("actual_found", 0) < count and not session.get("stop", False):
-                    tasks = []
-                    for _ in range(10):
-                        code = self.generate_random_string(length)
-                        url = f"https://i.imgur.com/{code}.jpg"
-                        tasks.append(self.check_image_async(url, "imgur"))
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for result in results:
-                        session = self.sessions.get(user_id)
-                        if not session or session.get("stop", False):
-                            break
-                        if isinstance(result, Exception):
-                            continue
-                        url, ext = result
-                        analyzed += 1
-                        session["analyzed"] = analyzed
-                        if ext:
-                            found += 1
-                            last_found_time = time.time()
-                            session["found"] = found
-                            session["last_found_time"] = last_found_time
-                            await self.add_to_media_group(
-                                update, user_id, url, ext, count, found, "imgur"
-                            )
-                            await update_status()
-                            await asyncio.sleep(1)
-                        if analyzed % 10 == 0 or (ext and found > 0):
-                            await update_status()
-                    await asyncio.sleep(0.1)
-            except asyncio.CancelledError:
-                logger.info(f"Поиск Imgur для пользователя {user_id} отменён")
-            except Exception as e:
-                logger.error(f"Ошибка в поиске Imgur для пользователя {user_id}: {str(e)}")
-            finally:
-                if timeout_task:
-                    timeout_task.cancel()
-                    try:
-                        await timeout_task
-                    except:
-                        pass
-                session = self.sessions.get(user_id, {})
-                actual_found = session.get("actual_found", 0)
-                if user_id in self.media_groups and self.media_groups[user_id]:
-                    new_media = []
-                    for media in self.media_groups[user_id]:
-                        image_id = self.extract_image_id(media.caption)
-                        if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
-                            new_media.append(media)
-                    if new_media:
-                        logger.info(f"Финальная отправка {len(new_media)} изображений пользователю {user_id}")
-                        await self.send_media_group(update, new_media, user_id)
-                elapsed = int(time.time() - start_time)
-                logger.info(
-                    f"Imgur поиск пользователя {user_id} завершён. "
-                    f"Длина: {length}, количество: {count}, "
-                    f"найдено: {actual_found}, проверено: {analyzed}, "
-                    f"время: {self.format_time(elapsed)}"
-                )
-                await update.message.reply_text(
-                    f"✅ Поиск Imgur завершён\n"
-                    f"Длина: {length}\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено уникальных: {actual_found}/{count}\n"
-                    f"Проверено: {analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                self.cleanup_user_session(user_id)
+            while True:
+                try:
+                    session = self.sessions.get(user_id)
+                    if not session:
+                        return
+                    session["actual_found"] = 0
+                    session["_real_sent_ids"] = set()
+                    session["last_found_time"] = time.time()
+                    timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
+                    while session.get("actual_found", 0) < count and not session.get("stop", False):
+                        tasks = []
+                        for _ in range(10):
+                            code = self.generate_random_string(length)
+                            url = f"https://i.imgur.com/{code}.jpg"
+                            tasks.append(self.check_image_async(url, "imgur"))
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                        for result in results:
+                            session = self.sessions.get(user_id)
+                            if not session or session.get("stop", False):
+                                break
+                            if session.get("stop", False) or session.get("actual_found", 0) >= count:
+                                break
+                            if isinstance(result, Exception):
+                                msg = str(result)
+                                if "Flood control exceeded" in msg and "Retry in " in msg:
+                                    await self.handle_flood_control(update, msg)
+                                    continue
+                                logger.error(f"Ошибка в check_image_async: {result}")
+                                continue
+                            url, ext = result
+                            analyzed += 1
+                            session["analyzed"] = analyzed
+                            if ext:
+                                found += 1
+                                last_found_time = time.time()
+                                session["found"] = found
+                                session["last_found_time"] = last_found_time
+                                await self.add_to_media_group(
+                                    update, user_id, url, ext, count, found, "imgur"
+                                )
+                                await update_status()
+                                await asyncio.sleep(1)
+                            if analyzed % 10 == 0 or (ext and found > 0):
+                                await update_status()
+                        await asyncio.sleep(0.1)
+                    break # если вышли из основного while, то поиск завершён
+                except asyncio.CancelledError:
+                    logger.info(f"Поиск Imgur для пользователя {user_id} отменён")
+                    break
+                except Exception as e:
+                    logger.error(f"Ошибка в поиске Imgur для пользователя {user_id}: {str(e)}")
+                    await asyncio.sleep(10)  # После любой ошибки ждем и пробуем снова
+                finally:
+                    if timeout_task:
+                        timeout_task.cancel()
+                        try:
+                            await timeout_task
+                        except:
+                            pass
+            session = self.sessions.get(user_id, {})
+            actual_found = session.get("actual_found", 0)
+            if user_id in self.media_groups and self.media_groups[user_id]:
+                new_media = []
+                for media in self.media_groups[user_id]:
+                    image_id = self.extract_image_id(media.caption)
+                    if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
+                        new_media.append(media)
+                if new_media:
+                    logger.info(f"Финальная отправка {len(new_media)} изображений пользователю {user_id}")
+                    await self.send_media_group(update, new_media, user_id)
+            elapsed = int(time.time() - start_time)
+            logger.info(
+                f"Imgur поиск пользователя {user_id} завершён. "
+                f"Длина: {length}, количество: {count}, "
+                f"найдено: {actual_found}, проверено: {analyzed}, "
+                f"время: {self.format_time(elapsed)}"
+            )
+            await update.message.reply_text(
+                f"✅ Поиск Imgur завершён\n"
+                f"Длина: {length}\n"
+                f"Цель: {count} изображений\n"
+                f"Найдено уникальных: {actual_found}/{count}\n"
+                f"Проверено: {analyzed}\n"
+                f"Время: {self.format_time(elapsed)}"
+            )
+            self.cleanup_user_session(user_id)
 
         task = asyncio.create_task(search_loop())
         self.sessions[user_id] = {
@@ -655,7 +681,10 @@ class ImageBot:
                         session = self.sessions.get(user_id)
                         if not session or session.get("stop", False):
                             break
+                        if session.get("stop", False) or session.get("actual_found", 0) >= count:
+                            break
                         if isinstance(result, Exception):
+                            logger.error(f"Ошибка в extract_prnt_image_url_async: {result}")
                             continue
                         img_url = result
                         analyzed += 1
@@ -816,7 +845,6 @@ def main():
     application.add_handler(CommandHandler("getprnt", bot.get_prnt_images))
     application.add_handler(CommandHandler("stop", bot.stop))
     application.add_handler(CommandHandler("repeat", bot.repeat_last_command))
-
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
 
     logger.info("Бот запущен и готов к работе")
