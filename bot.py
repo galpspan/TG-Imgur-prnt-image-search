@@ -18,6 +18,7 @@ from telegram.ext import (
 )
 from telegram.error import RetryAfter, BadRequest
 
+# Настройка логирования
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -25,22 +26,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Отключаем логирование для httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 class ImageBot:
     def __init__(self):
-        self.valid_extensions = [".jpg", ".jpeg", ".png", ".gif"]
-        self.user_agents = [
+        self.valid_extensions: List[str] = [".jpg", ".jpeg", ".png", ".gif"]
+        self.user_agents: List[str] = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         ]
-        self.sessions = {}
-        self.last_commands = {}
-        self.media_groups = {}
-        self.sent_image_ids = {}
-        self.sent_single_messages = {}
-        self.max_group_size = 10
-        self.group_timeout = 30
-        self.search_timeout = 30
-        self.retry_attempts = 3
+        self.sessions: Dict[int, Dict] = {}
+        self.last_commands: Dict[int, Dict] = {}
+        self.media_groups: Dict[int, List[InputMediaPhoto]] = {}
+        self.sent_image_ids: Dict[int, Set[str]] = {}
+        self.sent_single_messages: Dict[int, Dict[str, Message]] = {}
+        self.max_group_size: int = 10
+        self.group_timeout: int = 30
+        self.search_timeout: int = 30
+        self.retry_attempts: int = 3
 
     def format_time(self, seconds: int) -> str:
         hours = seconds // 3600
