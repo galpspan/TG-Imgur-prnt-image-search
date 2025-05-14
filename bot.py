@@ -16,7 +16,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import RetryAfter, BadRequest
+from telegram.error import RetryAfter
 
 # Настройка логирования
 logging.basicConfig(
@@ -26,7 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Отключаем логирование для httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 class ImageBot:
@@ -360,6 +359,11 @@ class ImageBot:
         if not last_command:
             await update.message.reply_text("❗️Нет предыдущей команды для повторения.")
             return
+        # Проверка на идентичный активный поиск
+        active_session = self.sessions.get(user_id)
+        if active_session and not active_session.get("stop", True):
+            await update.message.reply_text("❗️Идентичный поиск уже выполняется.")
+            return
         if last_command["type"] == "imgur":
             context.args = [str(last_command["length"]), str(last_command["count"])]
             await self.get_imgur_images(update, context)
@@ -369,10 +373,6 @@ class ImageBot:
 
     async def get_imgur_images(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
-        prev_session = self.sessions.get(user_id)
-        if prev_session and prev_session.get("task"):
-            prev_session["stop"] = True
-            prev_session["task"].cancel()
 
         args = context.args
         if len(args) != 2:
@@ -393,6 +393,32 @@ class ImageBot:
         if not 1 <= count <= 50:
             await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
+
+        # Проверка идентичного поиска
+        last_command = self.last_commands.get(user_id)
+        active_session = self.sessions.get(user_id)
+        if (
+            active_session and not active_session.get("stop", True)
+            and last_command
+            and last_command["type"] == "imgur"
+            and last_command["length"] == length
+            and last_command["count"] == count
+        ):
+            await update.message.reply_text("❗️Идентичный поиск уже выполняется.")
+            return
+
+        # Останавливаем предыдущий поиск (корректно!)
+        if active_session and active_session.get("task"):
+            active_session["stop"] = True
+            old_task = active_session["task"]
+            try:
+                old_task.cancel()
+                await old_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Ошибка при завершении предыдущего поиска: {str(e)}")
+            self.cleanup_user_session(user_id)
 
         self.last_commands[user_id] = {
             "type": "imgur",
@@ -528,10 +554,6 @@ class ImageBot:
 
     async def get_prnt_images(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
-        prev_session = self.sessions.get(user_id)
-        if prev_session and prev_session.get("task"):
-            prev_session["stop"] = True
-            prev_session["task"].cancel()
 
         args = context.args
         if len(args) != 1:
@@ -547,6 +569,30 @@ class ImageBot:
         if not 1 <= count <= 50:
             await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
+
+        last_command = self.last_commands.get(user_id)
+        active_session = self.sessions.get(user_id)
+        if (
+            active_session and not active_session.get("stop", True)
+            and last_command
+            and last_command["type"] == "prnt"
+            and last_command["count"] == count
+        ):
+            await update.message.reply_text("❗️Идентичный поиск уже выполняется.")
+            return
+
+        # Останавливаем предыдущий поиск (корректно!)
+        if active_session and active_session.get("task"):
+            active_session["stop"] = True
+            old_task = active_session["task"]
+            try:
+                old_task.cancel()
+                await old_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Ошибка при завершении предыдущего поиска: {str(e)}")
+            self.cleanup_user_session(user_id)
 
         self.last_commands[user_id] = {
             "type": "prnt",
