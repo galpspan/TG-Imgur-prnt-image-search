@@ -265,7 +265,7 @@ class ImageBot:
             if image_id:
                 group_image_ids.add(image_id)
         await self.cleanup_duplicate_singles(user_id, group_image_ids)
-        new_ids = [img_id for img_id in group_image_ids if img_id not in self.sent_image_ids.get(user_id, set())]
+        new_ids = [img_id for img_id in group_image_ids if user_id not in self.sent_image_ids or img_id not in self.sent_image_ids[user_id]]
         while attempts < self.retry_attempts:
             try:
                 await update.message.reply_media_group(media=media_group)
@@ -874,9 +874,7 @@ class ImageBot:
                 elapsed = int(time.time() - start_time)
                 logger.info(
                     f"Prnt.sc поиск пользователя {user_id} завершён. "
-                    f"Количество: {count}, "
-                    f"найдено: {actual_found}, проверено: {analyzed}, "
-                    f"время: {self.format_time(elapsed)}"
+                    f"Количество: {count}, найдено: {actual_found}, проверено: {analyzed}, время: {self.format_time(elapsed)}"
                 )
                 await update.message.reply_text(
                     f"✅ Поиск prnt.sc завершён\n"
@@ -1085,9 +1083,7 @@ class ImageBot:
                 elapsed = int(time.time() - start_time)
                 logger.info(
                     f"pastenow.ru поиск пользователя {user_id} завершён. "
-                    f"Количество: {count}, "
-                    f"найдено: {actual_found}, проверено: {analyzed}, "
-                    f"время: {self.format_time(elapsed)}"
+                    f"Количество: {count}, найдено: {actual_found}, проверено: {analyzed}, время: {self.format_time(elapsed)}"
                 )
                 await update.message.reply_text(
                     f"✅ Поиск pastenow.ru завершён\n"
@@ -1290,9 +1286,7 @@ class ImageBot:
                 elapsed = int(time.time() - start_time)
                 logger.info(
                     f"Freeimage поиск пользователя {user_id} завершён. "
-                    f"Количество: {count}, "
-                    f"найдено: {actual_found}, проверено: {analyzed}, "
-                    f"время: {self.format_time(elapsed)}"
+                    f"Количество: {count}, найдено: {actual_found}, проверено: {analyzed}, время: {self.format_time(elapsed)}"
                 )
                 await update.message.reply_text(
                     f"✅ Поиск freeimage завершён\n"
