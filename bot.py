@@ -104,8 +104,11 @@ class ImageBot:
             if source == "freeimage" and "iili.io" not in url:
                 return None
 
+            # Увеличиваем timeout для freeimage
+            timeout_val = 10 if source == "freeimage" else 5
+
             headers = {"User-Agent": random.choice(self.user_agents)}
-            head_response = requests.head(url, headers=headers, timeout=5, allow_redirects=True)
+            head_response = requests.head(url, headers=headers, timeout=timeout_val, allow_redirects=True)
             if head_response.status_code != 200:
                 return None
 
@@ -113,7 +116,7 @@ class ImageBot:
             if not any(ext in content_type for ext in ["image/jpeg", "image/png", "image/gif"]):
                 return None
 
-            get_response = requests.get(url, headers=headers, stream=True, timeout=5)
+            get_response = requests.get(url, headers=headers, stream=True, timeout=timeout_val)
             if get_response.status_code != 200:
                 return None
 
@@ -275,7 +278,10 @@ class ImageBot:
                 self.sent_image_ids[user_id].update(group_image_ids)
                 session = self.sessions.get(user_id)
                 if session:
-                    session["actual_found"] = session.get("actual_found", 0) + len(new_ids)
+                    if "actual_found" not in session:
+                        session["actual_found"] = 0
+                    session["actual_found"] += len(new_ids)
+                    session["last_found_time"] = time.time()
                 return True
             except RetryAfter as e:
                 logger.warning(f"Rate limit exceeded для пользователя {user_id}. Waiting {e.retry_after} seconds")
@@ -312,7 +318,9 @@ class ImageBot:
 
             session = self.sessions.get(user_id)
             if session and image_id and (image_id not in session.get("_real_sent_ids", set())):
-                session["actual_found"] = session.get("actual_found", 0) + 1
+                if "actual_found" not in session:
+                    session["actual_found"] = 0
+                session["actual_found"] += 1
                 if "_real_sent_ids" not in session:
                     session["_real_sent_ids"] = set()
                 session["_real_sent_ids"].add(image_id)
@@ -333,12 +341,11 @@ class ImageBot:
         if source == "pastenow":
             image_id = url.split('/')[-1].split('?')[0].split('.')[0]
             display_url = f"[{image_id}]({url})"
-        if image_id and (user_id not in self.sent_image_ids or image_id not in self.sent_image_ids[user_id]):
-            caption = f"({found}/{count}) {display_url}"
-        else:
+        # Если изображение уже отправлено, считаем его дубликатом и не учитываем в общем счёте
+        if image_id and (user_id in self.sent_image_ids and image_id in self.sent_image_ids[user_id]):
             caption = f"(дубликат) {display_url}"
             return
-        # Для GIF отправляем сразу одиночное сообщение
+        caption = f"({found}/{count}) {display_url}"
         if ext == "gif":
             await self.send_single_media(update, url, caption, True, user_id)
             return
@@ -582,7 +589,7 @@ class ImageBot:
                 timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
                 last_status_update = 0
                 last_progress_analyzed = 0
-                while found < count and not session.get("stop", False):
+                while session.get("actual_found", 0) < count and not session.get("stop", False):
                     if self.is_locked_by_flood("imgur"):
                         wait_sec = int(self.flood_lock["imgur"] - time.time())
                         await update.message.reply_text(
@@ -601,7 +608,7 @@ class ImageBot:
                         session = self.sessions.get(user_id)
                         if not session or session.get("stop", False):
                             break
-                        if session.get("stop", False) or found >= count:
+                        if session.get("stop", False) or session.get("actual_found", 0) >= count:
                             break
                         if isinstance(result, FloodControlException):
                             await self.handle_flood_control(update, result.retry_in, "imgur")
@@ -622,7 +629,6 @@ class ImageBot:
                         session["analyzed"] = analyzed
                         if ext:
                             found += 1
-                            session["actual_found"] = found
                             last_found_time = time.time()
                             session["found"] = found
                             session["last_found_time"] = last_found_time
@@ -790,7 +796,7 @@ class ImageBot:
                 timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
                 last_status_update = 0
                 last_progress_analyzed = 0
-                while found < count and not session.get("stop", False):
+                while session.get("actual_found", 0) < count and not session.get("stop", False):
                     if self.is_locked_by_flood("prnt"):
                         wait_sec = int(self.flood_lock["prnt"] - time.time())
                         await update.message.reply_text(
@@ -808,7 +814,7 @@ class ImageBot:
                         session = self.sessions.get(user_id)
                         if not session or session.get("stop", False):
                             break
-                        if session.get("stop", False) or found >= count:
+                        if session.get("stop", False) or session.get("actual_found", 0) >= count:
                             break
                         if isinstance(result, FloodControlException):
                             await self.handle_flood_control(update, result.retry_in, "prnt")
@@ -834,7 +840,6 @@ class ImageBot:
                                 break
                             if ext and ext[1]:
                                 found += 1
-                                session["actual_found"] = found
                                 last_found_time = time.time()
                                 session["found"] = found
                                 session["last_found_time"] = last_found_time
@@ -1000,7 +1005,7 @@ class ImageBot:
                 timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
                 last_status_update = 0
                 last_progress_analyzed = 0
-                while found < count and not session.get("stop", False):
+                while session.get("actual_found", 0) < count and not session.get("stop", False):
                     if self.is_locked_by_flood("pastenow"):
                         wait_sec = int(self.flood_lock["pastenow"] - time.time())
                         await update.message.reply_text(
@@ -1010,7 +1015,8 @@ class ImageBot:
                         await asyncio.sleep(wait_sec)
                         continue
                     tasks = []
-                    for _ in range(5):
+                    # Увеличиваем число параллельных задач до 10 для повышения вероятности нахождения изображений
+                    for _ in range(10):
                         code = self.generate_random_string(length)
                         tasks.append(self.extract_pastenow_image_url_async(code))
                     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1018,7 +1024,7 @@ class ImageBot:
                         session = self.sessions.get(user_id)
                         if not session or session.get("stop", False):
                             break
-                        if session.get("stop", False) or found >= count:
+                        if session.get("stop", False) or session.get("actual_found", 0) >= count:
                             break
                         if isinstance(result, FloodControlException):
                             await self.handle_flood_control(update, result.retry_in, "pastenow")
@@ -1044,7 +1050,6 @@ class ImageBot:
                                 break
                             if ext and ext[1]:
                                 found += 1
-                                session["actual_found"] = found
                                 last_found_time = time.time()
                                 session["found"] = found
                                 session["last_found_time"] = last_found_time
@@ -1208,7 +1213,7 @@ class ImageBot:
                 timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
                 last_status_update = 0
                 last_progress_analyzed = 0
-                while found < count and not session.get("stop", False):
+                while session.get("actual_found", 0) < count and not session.get("stop", False):
                     if self.is_locked_by_flood("freeimage"):
                         wait_sec = int(self.flood_lock["freeimage"] - time.time())
                         await update.message.reply_text(
@@ -1218,7 +1223,8 @@ class ImageBot:
                         await asyncio.sleep(wait_sec)
                         continue
                     tasks = []
-                    for _ in range(5):
+                    # для freeimage увеличиваем число запросов до 10 за итерацию
+                    for _ in range(10):
                         code = self.generate_random_string(length)
                         url = f"https://iili.io/{code}.jpg"
                         tasks.append(self.check_image_async(url, "freeimage"))
@@ -1227,7 +1233,7 @@ class ImageBot:
                         session = self.sessions.get(user_id)
                         if not session or session.get("stop", False):
                             break
-                        if session.get("stop", False) or found >= count:
+                        if session.get("stop", False) or session.get("actual_found", 0) >= count:
                             break
                         if isinstance(result, FloodControlException):
                             await self.handle_flood_control(update, result.retry_in, "freeimage")
@@ -1248,7 +1254,6 @@ class ImageBot:
                         session["analyzed"] = analyzed
                         if ext:
                             found += 1
-                            session["actual_found"] = found
                             last_found_time = time.time()
                             session["found"] = found
                             session["last_found_time"] = last_found_time
