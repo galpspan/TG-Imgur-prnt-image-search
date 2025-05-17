@@ -1031,6 +1031,11 @@ class ImageBot:
                             break
                         if isinstance(result, Exception):
                             msg = str(result)
+                            # Если обнаружен timeout, ждем 60 секунд и продолжаем поиск
+                            if "timeout" in msg.lower() or "time out" in msg.lower():
+                                await update.message.reply_text("❗️Ошибка таймаута на pastenow, жду 60 секунд, продолжаю поиск.")
+                                await asyncio.sleep(60)
+                                continue
                             if "Flood control exceeded" in msg and "Retry in " in msg:
                                 try:
                                     retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
@@ -1086,7 +1091,7 @@ class ImageBot:
                         await self.send_media_group(update, new_media, user_id)
                 elapsed = int(time.time() - start_time)
                 logger.info(
-                    f"pastenow.ru поиск пользователя {user_id} завершён. "
+                    f"Pastenow.ru поиск пользователя {user_id} завершён. "
                     f"Количество: {count}, найдено: {actual_found}, проверено: {analyzed}, время: {self.format_time(elapsed)}"
                 )
                 await update.message.reply_text(
@@ -1223,7 +1228,7 @@ class ImageBot:
                         await asyncio.sleep(wait_sec)
                         continue
                     tasks = []
-                    # для freeimage увеличиваем число запросов до 10 за итерацию
+                    # Для freeimage увеличиваем число запросов до 10 за итерацию
                     for _ in range(10):
                         code = self.generate_random_string(length)
                         url = f"https://iili.io/{code}.jpg"
@@ -1240,6 +1245,11 @@ class ImageBot:
                             break
                         if isinstance(result, Exception):
                             msg = str(result)
+                            # Если обнаружен таймаут, ждем 60 секунд и продолжаем поиск
+                            if "timeout" in msg.lower() or "time out" in msg.lower():
+                                await update.message.reply_text("❗️Ошибка таймаута на freeimage, жду 60 секунд, продолжаю поиск.")
+                                await asyncio.sleep(60)
+                                continue
                             if "Flood control exceeded" in msg and "Retry in " in msg:
                                 try:
                                     retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
