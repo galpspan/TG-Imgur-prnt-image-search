@@ -85,6 +85,22 @@ class ImageBot:
         self.search_timeout: int = 30
         self.retry_attempts: int = 3
         self.flood_lock: Dict[str, float] = {}
+        self.command_cooldowns: Dict[int, float] = {}
+        self.cooldown_duration: int = 60
+
+    async def check_cooldown(self, update: Update, user_id: int) -> bool:
+        """Check if user is on cooldown and send message if true"""
+        last_command_time = self.command_cooldowns.get(user_id, 0)
+        current_time = time.time()
+        remaining = (last_command_time + self.cooldown_duration) - current_time
+        
+        if remaining > 0:
+            await update.message.reply_text(
+                f"⚠️ Пожалуйста, подождите {format_time_full(int(remaining))} "
+                "перед отправкой следующей команды, чтобы избежать блокировки бота."
+            )
+            return True
+        return False
 
     def format_time(self, seconds: int) -> str:
         return format_time(seconds)
@@ -256,7 +272,6 @@ class ImageBot:
                 
                 if new_media:
                     logger.info(f"Таймаут достигнут, отправка {len(new_media)} новых изображений пользователю {user_id}")
-                    # Split into chunks of max_group_size
                     for i in range(0, len(new_media), self.max_group_size):
                         chunk = new_media[i:i + self.max_group_size]
                         await self.send_media_group(update, chunk, user_id)
@@ -286,8 +301,13 @@ class ImageBot:
                 if user_id not in self.sent_image_ids:
                     self.sent_image_ids[user_id] = set()
                 self.sent_image_ids[user_id].update(group_image_ids)
+                
                 session = self.sessions.get(user_id)
                 if session:
+                    if "_session_sent_ids" not in session:
+                        session["_session_sent_ids"] = set()
+                    session["_session_sent_ids"].update(new_ids)
+                    
                     if "actual_found" not in session:
                         session["actual_found"] = 0
                     session["actual_found"] += len(new_ids)
@@ -311,31 +331,31 @@ class ImageBot:
             if not is_gif and image_id and user_id in self.sent_image_ids and image_id in self.sent_image_ids[user_id]:
                 logger.info(f"Изображение {image_id} уже было отправлено, пропускаем")
                 return True
-
+    
             if is_gif:
                 msg = await update.message.reply_animation(animation=url, caption=caption, parse_mode="Markdown")
             else:
                 msg = await update.message.reply_photo(photo=url, caption=caption, parse_mode="Markdown")
-
+    
             if not is_gif and image_id:
                 if user_id not in self.sent_single_messages:
                     self.sent_single_messages[user_id] = {}
                 self.sent_single_messages[user_id][image_id] = msg
-
+    
             if user_id not in self.sent_image_ids:
                 self.sent_image_ids[user_id] = set()
             if image_id:
                 self.sent_image_ids[user_id].add(image_id)
-
-            session = self.sessions.get(user_id)
-            if session and image_id and (image_id not in session.get("_real_sent_ids", set())):
-                if "actual_found" not in session:
-                    session["actual_found"] = 0
-                session["actual_found"] += 1
-                if "_real_sent_ids" not in session:
-                    session["_real_sent_ids"] = set()
-                session["_real_sent_ids"].add(image_id)
-
+                session = self.sessions.get(user_id)
+                if session:
+                    if "_session_sent_ids" not in session:
+                        session["_session_sent_ids"] = set()
+                    if image_id not in session["_session_sent_ids"]:
+                        session["_session_sent_ids"].add(image_id)
+                        if "actual_found" not in session:
+                            session["actual_found"] = 0
+                        session["actual_found"] += 1
+    
             logger.info(f"Пользователю {user_id} отправлено {'GIF' if is_gif else 'одиночное изображение'} {image_id}")
             return True
         except RetryAfter as e:
@@ -353,7 +373,6 @@ class ImageBot:
             image_id = url.split('/')[-1].split('?')[0].split('.')[0]
             display_url = f"[{image_id}]({url})"
         
-        # Check if image was already sent
         if image_id and (user_id in self.sent_image_ids and image_id in self.sent_image_ids[user_id]):
             logger.info(f"Изображение {image_id} уже было отправлено, пропускаем")
             return
@@ -367,7 +386,6 @@ class ImageBot:
         if user_id not in self.media_groups:
             self.media_groups[user_id] = []
         
-        # Check if image is already in current group
         for media in self.media_groups[user_id]:
             if self.extract_image_id(media.caption) == image_id:
                 logger.info(f"Изображение {image_id} уже в текущей группе, пропускаем")
@@ -376,15 +394,11 @@ class ImageBot:
         media_item = InputMediaPhoto(media=url, caption=caption, parse_mode="Markdown")
         self.media_groups[user_id].append(media_item)
         
-        # Split into chunks of 10 when reaching or exceeding max_group_size
         while len(self.media_groups[user_id]) >= self.max_group_size:
-            # Take first 10 items
             group_to_send = self.media_groups[user_id][:self.max_group_size]
-            # Remove them from the main group
             self.media_groups[user_id] = self.media_groups[user_id][self.max_group_size:]
             
             if not await self.send_media_group(update, group_to_send, user_id):
-                # If sending as group fails, send individually
                 for media in group_to_send:
                     image_id = self.extract_image_id(media.caption)
                     if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
@@ -523,6 +537,10 @@ class ImageBot:
 
     async def search_all_sources(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
+        
+        if await self.check_cooldown(update, user_id):
+            return
+            
         args = context.args
         
         if len(args) != 1:
@@ -562,6 +580,8 @@ class ImageBot:
                 logger.error(f"Ошибка при завершении предыдущего поиска: {str(e)}")
             self.cleanup_user_session(user_id)
 
+        self.command_cooldowns[user_id] = time.time()
+        
         self.last_commands[user_id] = {
             "type": "all",
             "count": count,
@@ -883,7 +903,7 @@ class ImageBot:
                     ("pastenow", lambda: search_pastenow(session, min(remaining, max_per_source))),
                     ("freeimage", lambda: search_freeimage(session, min(remaining, max_per_source)))
                 ]
-
+        
                 tasks = []
                 for source_name, search_func in sources:
                     if found >= count or session.get("stop", False):
@@ -905,8 +925,10 @@ class ImageBot:
                     except:
                         pass
                 
-                session = self.sessions.get(user_id, {})
-                actual_found = session.get("actual_found", 0)
+                actual_found = 0
+                if user_id in self.sent_image_ids:
+                    session_sent = session.get("_session_sent_ids", set())
+                    actual_found = len(session_sent)
                 
                 if user_id in self.media_groups and self.media_groups[user_id]:
                     new_media = []
@@ -917,6 +939,7 @@ class ImageBot:
                     if new_media:
                         logger.info(f"Финальная отправка {len(new_media)} изображений пользователю {user_id}")
                         await self.send_media_group(update, new_media, user_id)
+                        actual_found += len([m for m in new_media if self.extract_image_id(m.caption) not in self.sent_image_ids.get(user_id, set())])
                 
                 elapsed = int(time.time() - start_time)
                 total_analyzed = sum(analyzed.values())
@@ -955,6 +978,10 @@ class ImageBot:
 
     async def get_imgur_images(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
+        
+        if await self.check_cooldown(update, user_id):
+            return
+            
         args = context.args
         if len(args) != 2:
             await update.message.reply_text("Используйте: /getimg <5|7> <1-50>")
@@ -1030,6 +1057,7 @@ class ImageBot:
             f"Проверено: 0\n"
             f"Время: 0с"
         )
+        self.command_cooldowns[user_id] = time.time()
 
         async def update_status(force=False):
             nonlocal last_status_update
@@ -1166,7 +1194,10 @@ class ImageBot:
 
     async def get_prnt_images(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
-
+        
+        if await self.check_cooldown(update, user_id):
+            return
+            
         args = context.args
         if len(args) != 1:
             await update.message.reply_text("Используйте: /getprnt <1-50>")
@@ -1237,6 +1268,7 @@ class ImageBot:
             f"Проверено: 0\n"
             f"Время: 0с"
         )
+        self.command_cooldowns[user_id] = time.time()
 
         async def update_status(force=False):
             nonlocal last_status_update
@@ -1375,6 +1407,9 @@ class ImageBot:
 
     async def get_pastenow_images(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
+        
+        if await self.check_cooldown(update, user_id):
+            return
 
         args = context.args
         if len(args) != 1:
@@ -1446,6 +1481,8 @@ class ImageBot:
             f"Проверено: 0\n"
             f"Время: 0с"
         )
+        
+        self.command_cooldowns[user_id] = time.time()
 
         async def update_status(force=False):
             nonlocal last_status_update
@@ -1588,6 +1625,10 @@ class ImageBot:
 
     async def get_freeimage_images(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
+        
+        if await self.check_cooldown(update, user_id):
+            return
+        
         args = context.args
         if len(args) != 1:
             await update.message.reply_text("Используйте: /getfreeimage <1-50>")
@@ -1657,6 +1698,8 @@ class ImageBot:
             f"Проверено: 0\n"
             f"Время: 0с"
         )
+        
+        self.command_cooldowns[user_id] = time.time()
 
         async def update_status(force=False):
             nonlocal last_status_update
@@ -1795,6 +1838,10 @@ class ImageBot:
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
+        user_id = update.effective_user.id
+
+        if text not in ["СТОП", "НАЗАД"] and await self.check_cooldown(update, user_id):
+            return
 
         if text == "PRNT.SC":
             reply_keyboard = [
