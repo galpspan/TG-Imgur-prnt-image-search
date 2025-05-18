@@ -253,21 +253,32 @@ class ImageBot:
                     image_id = self.extract_image_id(media.caption)
                     if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
                         new_media.append(media)
+                
                 if new_media:
                     logger.info(f"Таймаут достигнут, отправка {len(new_media)} новых изображений пользователю {user_id}")
-                    await self.send_media_group(update, new_media, user_id)
+                    # Split into chunks of max_group_size
+                    for i in range(0, len(new_media), self.max_group_size):
+                        chunk = new_media[i:i + self.max_group_size]
+                        await self.send_media_group(update, chunk, user_id)
+                    
                     self.sessions[user_id]["last_found_time"] = current_time
+                
                 self.media_groups[user_id] = []
 
     async def send_media_group(self, update: Update, media_group: List[InputMediaPhoto], user_id: int) -> bool:
+        if not media_group:
+            return True
+            
         attempts = 0
         group_image_ids = set()
         for media in media_group:
             image_id = self.extract_image_id(media.caption)
             if image_id:
                 group_image_ids.add(image_id)
+        
         await self.cleanup_duplicate_singles(user_id, group_image_ids)
         new_ids = [img_id for img_id in group_image_ids if user_id not in self.sent_image_ids or img_id not in self.sent_image_ids[user_id]]
+        
         while attempts < self.retry_attempts:
             try:
                 await update.message.reply_media_group(media=media_group)
@@ -290,6 +301,7 @@ class ImageBot:
                 logger.error(f"Ошибка при отправке группы пользователю {user_id}: {str(e)}")
                 attempts += 1
                 await asyncio.sleep(1)
+        
         logger.warning(f"Не удалось отправить группу пользователю {user_id} после {self.retry_attempts} попыток")
         return False
 
@@ -340,30 +352,54 @@ class ImageBot:
         if source == "pastenow":
             image_id = url.split('/')[-1].split('?')[0].split('.')[0]
             display_url = f"[{image_id}]({url})"
+        
+        # Check if image was already sent
         if image_id and (user_id in self.sent_image_ids and image_id in self.sent_image_ids[user_id]):
-            caption = f"(дубликат) {display_url}"
+            logger.info(f"Изображение {image_id} уже было отправлено, пропускаем")
             return
+        
         caption = f"({found}/{count}) {display_url} [{source.upper()}]"
+        
         if ext == "gif":
             await self.send_single_media(update, url, caption, True, user_id)
             return
+        
         if user_id not in self.media_groups:
             self.media_groups[user_id] = []
+        
+        # Check if image is already in current group
+        for media in self.media_groups[user_id]:
+            if self.extract_image_id(media.caption) == image_id:
+                logger.info(f"Изображение {image_id} уже в текущей группе, пропускаем")
+                return
+        
         media_item = InputMediaPhoto(media=url, caption=caption, parse_mode="Markdown")
         self.media_groups[user_id].append(media_item)
-        if len(self.media_groups[user_id]) >= self.max_group_size:
-            if not await self.send_media_group(update, self.media_groups[user_id], user_id):
-                for media in self.media_groups[user_id]:
-                    try:
-                        await self.send_single_media(
-                            update,
-                            media.media,
-                            media.caption,
-                            False,
-                            user_id
-                        )
-                    except Exception as e:
-                        logger.error(f"Ошибка при отправке одиночного изображения: {str(e)}")
+        
+        # Split into chunks of 10 when reaching or exceeding max_group_size
+        while len(self.media_groups[user_id]) >= self.max_group_size:
+            # Take first 10 items
+            group_to_send = self.media_groups[user_id][:self.max_group_size]
+            # Remove them from the main group
+            self.media_groups[user_id] = self.media_groups[user_id][self.max_group_size:]
+            
+            if not await self.send_media_group(update, group_to_send, user_id):
+                # If sending as group fails, send individually
+                for media in group_to_send:
+                    image_id = self.extract_image_id(media.caption)
+                    if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
+                        try:
+                            is_gif = media.caption and ".gif" in media.caption.lower()
+                            await self.send_single_media(
+                                update,
+                                media.media,
+                                media.caption,
+                                is_gif,
+                                user_id
+                            )
+                        except Exception as e:
+                            logger.error(f"Ошибка при отправке одиночного изображения: {str(e)}")
+            
             self.media_groups[user_id] = []
 
     async def show_main_menu(self, update: Update):
