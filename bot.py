@@ -86,7 +86,7 @@ class ImageBot:
         self.retry_attempts: int = 3
         self.flood_lock: Dict[str, float] = {}
         self.command_cooldowns: Dict[int, float] = {}
-        self.cooldown_duration: int = 60
+        self.cooldown_duration: int = 180
 
     async def check_cooldown(self, update: Update, user_id: int) -> bool:
         """Check if user is on cooldown and send message if true"""
