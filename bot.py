@@ -5,9 +5,8 @@ import string
 import time
 import asyncio
 import requests
-from bs4 import BeautifulSoup
-from typing import Union, List, Dict, Set
-from telegram import Update, ReplyKeyboardMarkup, InputMediaPhoto, Message
+from typing import List, Dict, Set, Tuple, Optional, Union
+from telegram import Update, ReplyKeyboardMarkup, InputMediaPhoto, Message, InputMediaAnimation
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,8 +15,9 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import RetryAfter
-from io import BytesIO
+from telegram.error import RetryAfter, BadRequest, Forbidden
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from bs4 import BeautifulSoup
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -26,6 +26,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# ======================= НАСТРОЙКИ ИСТОЧНИКОВ =======================
+# Весовые коэффициенты для распределения поиска между источниками.
+# Определяют, какая доля изображений будет искаться в каждом источнике.
+# Сумма всех значений должна быть равна 1.0 (100%).
+SOURCE_WEIGHTS = {
+    'imgur5': 0.1,   # 10% изображений будет искаться на Imgur с 5-символьными кодами
+    'imgur7': 0.2,   # 20% изображений будет искаться на Imgur с 7-символьными кодами
+    'prnt': 0.2,     # 20% изображений будет искаться на prnt.sc
+    'pastenow': 0.2, # 20% изображений будет искаться на paste.pics
+    'freeimage': 0.3 # 30% изображений будет искаться на freeimage
+}
+
+# Размеры пакетов для проверки изображений в каждом источнике.
+# Определяет, сколько URL/кодов генерируется и проверяется за один запрос.
+BATCH_SIZES = {
+    'imgur5': 5,     # Для Imgur 5-символьных - 5 URL за раз
+    'imgur7': 10,    # Для Imgur 7-символьных - 10 URL за раз
+    'prnt': 10,      # Для prnt.sc - 10 кодов за раз
+    'pastenow': 10,  # Для paste.pics - 10 кодов за раз
+    'freeimage': 10  # Для freeimage - 10 URL за раз
+}
+
+# Время (в секундах), на которое отключается источник после ошибки.
+# Если источник возвращает ошибку, он будет временно отключен на это время.
+SOURCE_TIMEOUT = 600  # 10 минут (600 секунд)
+
+# Максимальный размер группы медиа при отправке в Telegram.
+# Telegram позволяет отправлять до 10 медиа в одной группе.
+MAX_GROUP_SIZE = 10
+
+# Таймаут (в секундах) для отправки неполной группы медиа.
+# Если в течение этого времени не найдено новых изображений для группы,
+# неполная группа будет отправлена.
+GROUP_TIMEOUT = 60  # 1 минута
+
+# Интервал (в секундах) для обновления статусного сообщения.
+# Как часто обновляется сообщение с прогрессом поиска.
+STATUS_UPDATE_INTERVAL = 10  # 10 секунд
+
+# Частота обновления статуса при нахождении изображений.
+# Статус будет обновляться каждые N найденных изображений.
+UPDATE_ON_FOUND = 5  # Обновлять статус каждые 5 найденных изображений
+
+# Частота обновления статуса при проверке URL.
+# Статус будет обновляться каждые N проверенных URL.
+UPDATE_ON_CHECKED = 50  # Обновлять статус каждые 50 проверенных URL
+# =====================================================================
 
 def format_time(seconds: int) -> str:
     hours = seconds // 3600
@@ -50,19 +98,6 @@ def add_flood_control_reserve(retry_in: int) -> int:
     else:
         return retry_in + 20
 
-def format_time_full(seconds: int) -> str:
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    out = []
-    if h > 0:
-        out.append(f"{h} ч")
-    if m > 0:
-        out.append(f"{m} мин")
-    if s > 0 or not out:
-        out.append(f"{s} сек")
-    return " ".join(out)
-
 class FloodControlException(Exception):
     def __init__(self, retry_in: int):
         self.retry_in = retry_in
@@ -70,139 +105,214 @@ class FloodControlException(Exception):
 
 class ImageBot:
     def __init__(self):
-        self.valid_extensions: List[str] = [".jpg", ".jpeg", ".png", ".gif"]
-        self.user_agents: List[str] = [
+        self.valid_extensions = [".jpg", ".jpeg", ".png", ".gif"]
+        self.user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         ]
-        self.sessions: Dict[int, Dict] = {}
-        self.last_commands: Dict[int, Dict] = {}
-        self.media_groups: Dict[int, List[InputMediaPhoto]] = {}
-        self.sent_image_ids: Dict[int, Set[str]] = {}
-        self.sent_single_messages: Dict[int, Dict[str, Message]] = {}
-        self.max_group_size: int = 10
-        self.group_timeout: int = 30
-        self.search_timeout: int = 30
-        self.retry_attempts: int = 3
+        # Словарь активных сессий пользователей.
+        # Ключ: кортеж (chat_id, user_id) - идентификатор чата и пользователя
+        # Значение: словарь с данными текущей сессии поиска
+        self.sessions: Dict[Tuple[int, int], Dict] = {}
+        
+        # Словарь последних выполненных команд пользователей.
+        # Ключ: кортеж (chat_id, user_id)
+        # Значение: словарь с параметрами последней команды (тип, количество и т.д.)
+        self.last_commands: Dict[Tuple[int, int], Dict] = {}
+        
+        # Группы медиа для отправки пользователям.
+        # Ключ: кортеж (chat_id, user_id)
+        # Значение: список InputMediaPhoto/InputMediaAnimation для групповой отправки
+        self.media_groups: Dict[Tuple[int, int], List] = {}
+        
+        # Уникальные идентификаторы уже отправленных изображений.
+        # Ключ: кортеж (chat_id, user_id)
+        # Значение: множество строковых ID изображений (для предотвращения дубликатов)
+        self.sent_image_ids: Dict[Tuple[int, int], Set[str]] = {}
+        
+        # Блокировка источников при флуд-контроле.
+        # Ключ: название источника ('imgur', 'prnt' и т.д.)
+        # Значение: временная метка (timestamp) до которой источник заблокирован
         self.flood_lock: Dict[str, float] = {}
-        self.command_cooldowns: Dict[int, float] = {}
-        self.cooldown_duration: int = 180
+        
+        # Временные метки последних команд пользователей.
+        # Ключ: user_id
+        # Значение: временная метка последней команды (для кулдауна)
+        self.command_cooldowns: Dict[Tuple[int, int], float] = {}
+        # Длительность кулдауна между командами (в секундах).
+        # Пользователь не может отправлять команды чаще, чем раз в это время
+        self.cooldown_duration: int = 180  # 3 минуты
+        
+        # Исполнитель для запуска синхронных задач в отдельных потоках.
+        # Позволяет выполнять блокирующие операции (например, HTTP-запросы)
+        # без блокировки основного event loop'а
+        self.executor = ThreadPoolExecutor(max_workers=20)  # Макс. 20 параллельных потоков
+        
+        # Блокировка для синхронизации доступа к общим ресурсам
+        # при работе с асинхронным кодом (защита от race conditions)
+        self.lock = asyncio.Lock()
+        
+        # Временные ошибки источников.
+        # Ключ: название источника ('imgur', 'prnt' и т.д.)
+        # Значение: временная метка последней ошибки (для временного отключения источника)
+        self.source_errors: Dict[str, float] = {}
+        
+        # Количество попыток повтора при неудачной отправке медиагруппы
+        self.retry_attempts: int = 3
 
-    async def check_cooldown(self, update: Update, user_id: int) -> bool:
-        """Check if user is on cooldown and send message if true"""
-        last_command_time = self.command_cooldowns.get(user_id, 0)
+    def get_key(self, update: Update) -> Tuple[int, int]:
+        return (update.effective_chat.id, update.effective_user.id)
+
+    def extract_image_id(self, caption: str) -> Optional[str]:
+        if not caption:
+            return None
+        try:
+            parts = caption.split('[')
+            if len(parts) > 1:
+                return parts[1].split(']')[0]
+        except Exception:
+            pass
+        return None
+
+    async def check_cooldown(self, update: Update) -> bool:
+        key = self.get_key(update)
+        last_command_time = self.command_cooldowns.get(key, 0)
         current_time = time.time()
         remaining = (last_command_time + self.cooldown_duration) - current_time
         
         if remaining > 0:
             await update.message.reply_text(
-                f"⚠️ Пожалуйста, подождите {format_time_full(int(remaining))} "
+                f"⚠️ Пожалуйста, подождите {format_time(int(remaining))} "
                 "перед отправкой следующей команды, чтобы избежать блокировки бота."
             )
             return True
         return False
 
-    def format_time(self, seconds: int) -> str:
-        return format_time(seconds)
+    async def safe_reply_text(self, update: Update, text: str, max_retries: int = 3) -> bool:
+        key = self.get_key(update)
+        retries = 0
+        while retries < max_retries:
+            try:
+                await update.message.reply_text(text)
+                return True
+            except RetryAfter as e:
+                wait = e.retry_after
+                logger.warning(f"Flood control при отправке текста для {key}. Ожидание {wait} секунд")
+                await asyncio.sleep(wait)
+                retries += 1
+            except Forbidden as e:
+                logger.error(f"Бот заблокирован пользователем {key}: {str(e)}")
+                return False
+            except Exception as e:
+                logger.error(f"Ошибка при отправке текста для {key}: {str(e)}")
+                retries += 1
+                await asyncio.sleep(1)
+        logger.error(f"Не удалось отправить сообщение для {key} после {max_retries} попыток")
+        return False
 
     def generate_random_string(self, length: int) -> str:
         chars = string.ascii_lowercase + string.digits
         return "".join(random.choice(chars) for _ in range(length))
 
-    def check_image(self, url: str, source: str = "any") -> Union[str, None]:
+    async def check_image(self, url: str, source: str = "any") -> Tuple[Optional[str], Optional[str]]:
         try:
-            if source == "prnt" and not any(d in url for d in ["prnt.sc", "prntscr.com"]):
-                return None
-            if source == "imgur" and "imgur.com" not in url:
-                return None
-            if source == "pastenow" and "paste.pics" not in url:
-                return None
-            if source == "freeimage" and "iili.io" not in url:
-                return None
-
-            timeout_val = 10 if source == "freeimage" else 5
-
+            loop = asyncio.get_running_loop()
             headers = {"User-Agent": random.choice(self.user_agents)}
-            head_response = requests.head(url, headers=headers, timeout=timeout_val, allow_redirects=True)
+            
+            head_response = await loop.run_in_executor(
+                self.executor, 
+                lambda: requests.head(url, headers=headers, timeout=10, allow_redirects=True)
+            )
+            
             if head_response.status_code != 200:
-                return None
-
-            content_type = head_response.headers.get("content-type", "")
-            if not any(ext in content_type for ext in ["image/jpeg", "image/png", "image/gif"]):
-                return None
-
-            get_response = requests.get(url, headers=headers, stream=True, timeout=timeout_val)
-            if get_response.status_code != 200:
-                return None
-
-            content_length = int(get_response.headers.get("content-length", 0))
-            if content_length < 1024 or content_length > 20 * 1024 * 1024:
-                return None
-
-            first_chunk = next(get_response.iter_content(4))
-            if first_chunk.startswith(b"\xFF\xD8\xFF"):
-                return "jpg"
-            elif first_chunk.startswith(b"\x89PNG"):
-                return "png"
-            elif first_chunk.startswith(b"GIF8"):
-                return "gif"
-
-            return None
+                return url, None
+                
+            content_type = head_response.headers.get("content-type", "").lower()
+            if 'image' not in content_type and 'video' not in content_type:
+                return url, None
+                
+            if 'imgur' in source and "removed" in head_response.url:
+                return url, None
+                
+            if 'gif' in content_type:
+                return url, 'gif'
+            elif 'jpeg' in content_type or 'jpg' in content_type:
+                return url, 'jpg'
+            elif 'png' in content_type:
+                return url, 'png'
+                
+            return url, None
         except Exception as e:
-            msg = str(e)
-            if "Flood control exceeded" in msg and "Retry in " in msg:
-                try:
-                    retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
-                    raise FloodControlException(retry_in)
-                except Exception:
-                    raise
-            return None
+            logger.error(f"Ошибка при проверке изображения: {str(e)}")
+            return url, None
 
-    async def check_image_async(self, url, source="any"):
-        loop = asyncio.get_event_loop()
-        try:
-            ext = await loop.run_in_executor(None, self.check_image, url, source)
-            return url, ext
-        except FloodControlException as fce:
-            return fce
-        except Exception as e:
-            return e
-
-    def extract_prnt_image_url(self, code: str) -> Union[str, None]:
+    async def extract_prnt_image_url(self, code: str) -> Optional[str]:
         try:
             url = f"https://prnt.sc/{code}"
-            headers = {"User-Agent": random.choice(self.user_agents)}
-            response = requests.get(url, headers=headers, timeout=5)
-            response.raise_for_status()
+            headers = {
+                "User-Agent": random.choice(self.user_agents),
+                "Referer": "https://prnt.sc/",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1"
+            }
+            
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                self.executor, 
+                lambda: requests.get(url, headers=headers, timeout=10)
+            )
+            
+            if response.status_code != 200:
+                return None
 
             soup = BeautifulSoup(response.text, "html.parser")
+            no_image_div = soup.find('div', class_='no-image')
+            if no_image_div:
+                return None
+
+            img_url = None
             img_tag = soup.find("img", {"class": "screenshot-image"})
             if img_tag and "src" in img_tag.attrs:
                 img_url = img_tag["src"]
                 if img_url.startswith("//"):
                     img_url = f"https:{img_url}"
                 elif not img_url.startswith("http"):
-                    return None
-                if "prntscr.com/placeholder" in img_url:
-                    return None
-                return img_url
-            return None
+                    img_url = None
+
+            if not img_url:
+                meta = soup.find("meta", {"property": "og:image"})
+                if meta and meta.get("content"):
+                    img_url = meta["content"]
+                    if img_url.startswith("//"):
+                        img_url = f"https:{img_url}"
+
+            if not img_url:
+                return None
+                
+            if "prntscr.com/placeholder" in img_url.lower() or "st.prntscr.com" in img_url.lower():
+                return None
+
+            return img_url
         except Exception as e:
             logger.error(f"Ошибка при парсинге prnt.sc: {str(e)}")
+            self.source_errors["prnt"] = time.time()
             return None
 
-    async def extract_prnt_image_url_async(self, code):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.extract_prnt_image_url, code)
-
-    def extract_pastenow_image_url(self, code: str) -> Union[str, None]:
+    async def extract_pastenow_image_url(self, code: str) -> Optional[str]:
         try:
             url = f"https://ru.paste.pics/{code}"
             headers = {"User-Agent": random.choice(self.user_agents)}
-            response = requests.get(url, headers=headers, timeout=8)
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                self.executor, 
+                lambda: requests.get(url, headers=headers, timeout=10)
+            )
+            
             if response.status_code == 404:
                 return None
-            response.raise_for_status()
+                
             soup = BeautifulSoup(response.text, "html.parser")
             content_div = soup.find('div', id='content')
             if content_div:
@@ -214,207 +324,130 @@ class ImageBot:
                     if "placeholder" in img_url or "logo" in img_url:
                         return None
                     return img_url
+                    
             meta = soup.find("meta", {"property": "og:image"})
             if meta and meta.get("content"):
                 return meta["content"]
+                
             return None
         except requests.exceptions.HTTPError as e:
-            if hasattr(e.response, "status_code") and e.response.status_code == 404:
+            if e.response.status_code == 404:
                 return None
-            logger.debug(f"404 для ru.paste.pics/{code}")
+            logger.error(f"HTTP ошибка при парсинге paste.pics: {str(e)}")
+            self.source_errors["pastenow"] = time.time()
             return None
         except Exception as e:
-            logger.error(f"Ошибка при парсинге ru.paste.pics: {str(e)}")
+            logger.error(f"Ошибка при парсинге paste.pics: {str(e)}")
+            self.source_errors["pastenow"] = time.time()
             return None
 
-    async def extract_pastenow_image_url_async(self, code):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.extract_pastenow_image_url, code)
-    
-    def extract_image_id(self, caption: str) -> str:
-        if not caption:
-            return ""
-        try:
-            start = caption.find("[") + 1
-            end = caption.find("]")
-            return caption[start:end] if start > 0 and end > start else ""
-        except Exception:
-            return ""
-
-    async def cleanup_duplicate_singles(self, user_id: int, group_image_ids: Set[str]) -> int:
-        if user_id not in self.sent_single_messages:
-            return 0
-        deleted = 0
-        single_ids = list(self.sent_single_messages[user_id].keys())
-        for image_id in single_ids:
-            if image_id in group_image_ids:
-                msg = self.sent_single_messages[user_id][image_id]
-                try:
-                    await msg.delete()
-                    del self.sent_single_messages[user_id][image_id]
-                    deleted += 1
-                    logger.info(f"Удалено дублирующееся одиночное сообщение {image_id} для пользователя {user_id}")
-                except Exception as e:
-                    logger.error(f"Ошибка при удалении сообщения {image_id}: {str(e)}")
-        return deleted
-
-    async def check_and_send_timeout(self, update: Update, user_id: int):
-        while not self.sessions.get(user_id, {}).get("stop", True):
-            await asyncio.sleep(1)
-            current_time = time.time()
-            if (user_id in self.media_groups and self.media_groups[user_id] and
-                current_time - self.sessions[user_id].get("last_found_time", 0) > self.group_timeout):
-                new_media = []
-                for media in self.media_groups[user_id]:
-                    image_id = self.extract_image_id(media.caption)
-                    if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
-                        new_media.append(media)
-                
-                if new_media:
-                    logger.info(f"Таймаут достигнут, отправка {len(new_media)} новых изображений пользователю {user_id}")
-                    for i in range(0, len(new_media), self.max_group_size):
-                        chunk = new_media[i:i + self.max_group_size]
-                        await self.send_media_group(update, chunk, user_id)
-                    
-                    self.sessions[user_id]["last_found_time"] = current_time
-                
-                self.media_groups[user_id] = []
-
-    async def send_media_group(self, update: Update, media_group: List[InputMediaPhoto], user_id: int) -> bool:
+    async def send_media_group(self, update: Update, media_group: List, key: Tuple[int, int]) -> bool:
         if not media_group:
             return True
             
         attempts = 0
-        group_image_ids = set()
-        for media in media_group:
-            image_id = self.extract_image_id(media.caption)
-            if image_id:
-                group_image_ids.add(image_id)
-        
-        await self.cleanup_duplicate_singles(user_id, group_image_ids)
-        new_ids = [img_id for img_id in group_image_ids if user_id not in self.sent_image_ids or img_id not in self.sent_image_ids[user_id]]
-        
         while attempts < self.retry_attempts:
             try:
-                await update.message.reply_media_group(media=media_group)
-                logger.info(f"Пользователю {user_id} успешно отправлена группа из {len(media_group)} изображений")
-                if user_id not in self.sent_image_ids:
-                    self.sent_image_ids[user_id] = set()
-                self.sent_image_ids[user_id].update(group_image_ids)
-                
-                session = self.sessions.get(user_id)
-                if session:
-                    if "_session_sent_ids" not in session:
-                        session["_session_sent_ids"] = set()
-                    session["_session_sent_ids"].update(new_ids)
-                    
-                    if "actual_found" not in session:
-                        session["actual_found"] = 0
-                    session["actual_found"] += len(new_ids)
-                    session["last_found_time"] = time.time()
+                await update.message.reply_media_group(media=media_group, parse_mode="Markdown")
+                logger.info(f"Отправлена группа из {len(media_group)} медиа пользователю {key}")
                 return True
             except RetryAfter as e:
-                logger.warning(f"Rate limit exceeded для пользователя {user_id}. Waiting {e.retry_after} seconds")
+                logger.warning(f"Rate limit exceeded для пользователя {key}. Waiting {e.retry_after} seconds")
                 await asyncio.sleep(e.retry_after)
                 attempts += 1
+            except BadRequest as e:
+                logger.error(f"Ошибка при отправке группы медиа: {str(e)}")
+                for media in media_group:
+                    try:
+                        if isinstance(media, InputMediaAnimation):
+                            await update.message.reply_animation(animation=media.media, caption=media.caption, parse_mode="Markdown")
+                        else:
+                            await update.message.reply_photo(photo=media.media, caption=media.caption, parse_mode="Markdown")
+                    except Exception as e:
+                        logger.error(f"Ошибка при отправке отдельного медиа: {str(e)}")
+                return True
+            except Forbidden as e:
+                logger.error(f"Бот заблокирован пользователем {key}: {str(e)}")
+                return False
             except Exception as e:
-                logger.error(f"Ошибка при отправке группы пользователю {user_id}: {str(e)}")
+                logger.error(f"Ошибка при отправке группы медиа: {str(e)}")
                 attempts += 1
                 await asyncio.sleep(1)
-        
-        logger.warning(f"Не удалось отправить группу пользователю {user_id} после {self.retry_attempts} попыток")
+                
+        logger.warning(f"Не удалось отправить группу пользователю {key} после {self.retry_attempts} попыток")
         return False
 
-    async def send_single_media(self, update: Update, url: str, caption: str, is_gif: bool, user_id: int) -> bool:
+    async def send_single_media(self, update: Update, url: str, caption: str, is_gif: bool, key: Tuple[int, int]):
         try:
-            image_id = self.extract_image_id(caption)
-            if not is_gif and image_id and user_id in self.sent_image_ids and image_id in self.sent_image_ids[user_id]:
-                logger.info(f"Изображение {image_id} уже было отправлено, пропускаем")
-                return True
-    
             if is_gif:
-                msg = await update.message.reply_animation(animation=url, caption=caption, parse_mode="Markdown")
+                await update.message.reply_animation(animation=url, caption=caption, parse_mode="Markdown")
             else:
-                msg = await update.message.reply_photo(photo=url, caption=caption, parse_mode="Markdown")
-    
-            if not is_gif and image_id:
-                if user_id not in self.sent_single_messages:
-                    self.sent_single_messages[user_id] = {}
-                self.sent_single_messages[user_id][image_id] = msg
-    
-            if user_id not in self.sent_image_ids:
-                self.sent_image_ids[user_id] = set()
-            if image_id:
-                self.sent_image_ids[user_id].add(image_id)
-                session = self.sessions.get(user_id)
-                if session:
-                    if "_session_sent_ids" not in session:
-                        session["_session_sent_ids"] = set()
-                    if image_id not in session["_session_sent_ids"]:
-                        session["_session_sent_ids"].add(image_id)
-                        if "actual_found" not in session:
-                            session["actual_found"] = 0
-                        session["actual_found"] += 1
-    
-            logger.info(f"Пользователю {user_id} отправлено {'GIF' if is_gif else 'одиночное изображение'} {image_id}")
-            return True
-        except RetryAfter as e:
-            logger.warning(f"Rate limit exceeded для пользователя {user_id}. Waiting {e.retry_after} seconds")
-            await asyncio.sleep(e.retry_after)
-            return await self.send_single_media(update, url, caption, is_gif, user_id)
+                await update.message.reply_photo(photo=url, caption=caption, parse_mode="Markdown")
+        except Forbidden as e:
+            logger.error(f"Бот заблокирован пользователем {key}: {str(e)}")
         except Exception as e:
-            logger.error(f"Ошибка при отправке {'GIF' if is_gif else 'одиночного медиа'} пользователю {user_id}: {str(e)}")
-            return False
+            logger.error(f"Ошибка при отправке одиночного медиа: {str(e)}")
 
-    async def add_to_media_group(self, update: Update, user_id: int, url: str, ext: str, count: int, found: int, source: str):
-        image_id = url.split('/')[-1].split('.')[0]
-        display_url = f"[{image_id}]({url})"
+    async def add_to_media_group(self, update: Update, key: Tuple[int, int], url: str, ext: str, count: int, found: int, source: str):
         if source == "pastenow":
             image_id = url.split('/')[-1].split('?')[0].split('.')[0]
-            display_url = f"[{image_id}]({url})"
+        else:
+            image_id = url.split('/')[-1].split('.')[0]
         
-        if image_id and (user_id in self.sent_image_ids and image_id in self.sent_image_ids[user_id]):
-            logger.info(f"Изображение {image_id} уже было отправлено, пропускаем")
-            return
-        
+        display_url = f"[{image_id}]({url})"
         caption = f"({found}/{count}) {display_url} [{source.upper()}]"
         
-        if ext == "gif":
-            await self.send_single_media(update, url, caption, True, user_id)
+        if key not in self.sent_image_ids:
+            self.sent_image_ids[key] = set()
+        
+        if image_id and image_id in self.sent_image_ids[key]:
+            logger.info(f"Изображение {image_id} уже отправлено, пропускаем")
             return
         
-        if user_id not in self.media_groups:
-            self.media_groups[user_id] = []
+        if ext == "gif":
+            await self.send_single_media(update, url, caption, True, key)
+            if image_id:
+                self.sent_image_ids[key].add(image_id)
+            return
         
-        for media in self.media_groups[user_id]:
-            if self.extract_image_id(media.caption) == image_id:
-                logger.info(f"Изображение {image_id} уже в текущей группе, пропускаем")
+        if key not in self.media_groups:
+            self.media_groups[key] = []
+            asyncio.create_task(self.group_timer(update, key))
+        
+        for media in self.media_groups[key]:
+            media_id = self.extract_image_id(media.caption)
+            if media_id == image_id:
+                logger.info(f"Изображение {image_id} уже в группе, пропускаем")
                 return
         
         media_item = InputMediaPhoto(media=url, caption=caption, parse_mode="Markdown")
-        self.media_groups[user_id].append(media_item)
+        self.media_groups[key].append(media_item)
+        if image_id:
+            self.sent_image_ids[key].add(image_id)
         
-        while len(self.media_groups[user_id]) >= self.max_group_size:
-            group_to_send = self.media_groups[user_id][:self.max_group_size]
-            self.media_groups[user_id] = self.media_groups[user_id][self.max_group_size:]
+        if len(self.media_groups[key]) >= MAX_GROUP_SIZE:
+            media_to_send = self.media_groups[key]
+            self.media_groups[key] = []
+            await self.send_media_group(update, media_to_send, key)
+
+    async def group_timer(self, update: Update, key: Tuple[int, int]):
+        while True:
+            await asyncio.sleep(5)
             
-            if not await self.send_media_group(update, group_to_send, user_id):
-                for media in group_to_send:
-                    image_id = self.extract_image_id(media.caption)
-                    if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
-                        try:
-                            is_gif = media.caption and ".gif" in media.caption.lower()
-                            await self.send_single_media(
-                                update,
-                                media.media,
-                                media.caption,
-                                is_gif,
-                                user_id
-                            )
-                        except Exception as e:
-                            logger.error(f"Ошибка при отправке одиночного изображения: {str(e)}")
+            if key not in self.media_groups or not self.media_groups[key]:
+                break
+                
+            async with self.lock:
+                session = self.sessions.get(key, {})
+                last_found_time = session.get("last_found_time", 0)
             
-            self.media_groups[user_id] = []
+            current_time = time.time()
+            if (current_time - last_found_time) > GROUP_TIMEOUT:
+                if key in self.media_groups and self.media_groups[key]:
+                    media_to_send = self.media_groups[key]
+                    self.media_groups[key] = []
+                    await self.send_media_group(update, media_to_send, key)
+                break
 
     async def show_main_menu(self, update: Update):
         reply_keyboard = [
@@ -424,7 +457,7 @@ class ImageBot:
             ["ПОВТОРИТЬ", "СТОП"]
         ]
         await update.message.reply_text(
-            "Выберите действие:",
+            "Выберите источник изображений:",
             reply_markup=ReplyKeyboardMarkup(
                 reply_keyboard,
                 resize_keyboard=True,
@@ -437,14 +470,14 @@ class ImageBot:
         await self.show_main_menu(update)
         await update.message.reply_text(
             """
-Привет! Я ищу случайные изображения с разных сервисов.
+Привет! Я бот для поиска случайных изображений.
 
 Команды:
   /getimg <5|7> <1-50> — поиск на Imgur
-  /getprnt <1-50> — поиск на prnt.sc (код всегда 6 символов)
-  /getpastenow <1-50> — поиск на paste.pics (код всегда 5 символов)
-  /getfreeimage <1-50> — поиск на freeimage (код всегда 7 символов)
-  /getall <1-50> — поиск на всех источниках разом
+  /getprnt <1-50> — поиск на prnt.sc
+  /getpastenow <1-50> — поиск на paste.pics
+  /getfreeimage <1-50> — поиск на freeimage
+  /getall <1-50> — поиск по всем источникам
   /stop — остановить текущий поиск
   /repeat — повторить последний поиск
 
@@ -452,1396 +485,1102 @@ class ImageBot:
 """
         )
 
-    async def stop(self, update: Update, context: CallbackContext):
-        user_id = update.effective_user.id
-        if user_id not in self.sessions:
-            await update.message.reply_text("❗️ Нет активного поиска.")
-            return
+    async def stop(self, update: Update, context: CallbackContext, silent: bool = False):
+        key = self.get_key(update)
+        async with self.lock:
+            if key not in self.sessions:
+                if not silent:
+                    await self.safe_reply_text(update, "❗️ Нет активного поиска.")
+                return
+    
+            session = self.sessions[key]
+            session["stop"] = True
+    
+            if key in self.media_groups and self.media_groups[key]:
+                media_to_send = self.media_groups[key]
+                self.media_groups[key] = []
+                await self.send_media_group(update, media_to_send, key)
+    
+            if not silent:
+                elapsed = int(time.time() - session["start_time"])
+                target = session["target_count"]
+                found = session.get("found", 0)
+                analyzed = session.get("analyzed", 0)
+                stop_reason = session.get("stop_reason", "")
+                
+                message = f"🔴 Поиск остановлен\n"
+                if stop_reason == "source_disabled":
+                    message += "⚠️ Источник временно недоступен\n"
+                message += (
+                    f"Цель: {target} изображений\n"
+                    f"Найдено: {found}/{target}\n"
+                    f"Проверено: {analyzed}\n"
+                    f"Время: {format_time(elapsed)}"
+                )
+                
+                await self.safe_reply_text(update, message)
+            
+            self.cleanup_user_session(key)
+            if not silent:
+                await self.show_main_menu(update)
 
-        session = self.sessions[user_id]
-        session["stop"] = True
-
-        if user_id in self.media_groups and self.media_groups[user_id]:
-            new_media = []
-            for media in self.media_groups[user_id]:
-                image_id = self.extract_image_id(media.caption)
-                if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
-                    new_media.append(media)
-            if new_media:
-                await self.send_media_group(update, new_media, user_id)
-
-        task = session.get("task")
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Ошибка при завершении задачи поиска: {str(e)}")
-
-        self.cleanup_user_session(user_id)
-
-    def cleanup_user_session(self, user_id: int):
-        if user_id in self.sessions:
-            if self.sessions[user_id].get("task"):
-                self.sessions[user_id]["task"].cancel()
-            del self.sessions[user_id]
-        if user_id in self.media_groups:
-            del self.media_groups[user_id]
-        if user_id in self.sent_single_messages:
-            del self.sent_single_messages[user_id]
-        if user_id in self.sent_image_ids:
-            del self.sent_image_ids[user_id]
+    def cleanup_user_session(self, key: Tuple[int, int]):
+        if key in self.sessions:
+            session = self.sessions[key]
+            if "tasks" in session:
+                for task in session["tasks"]:
+                    if not task.done():
+                        task.cancel()
+            elif "task" in session and session["task"]:
+                if not session["task"].done():
+                    session["task"].cancel()
+            del self.sessions[key]
+        
+        if key in self.media_groups:
+            del self.media_groups[key]
+        
+        if key in self.sent_image_ids:
+            del self.sent_image_ids[key]
 
     async def repeat_last_command(self, update: Update, context: CallbackContext):
-        user_id = update.effective_user.id
-        last_command = self.last_commands.get(user_id)
+        key = self.get_key(update)
+        last_command = self.last_commands.get(key)
         if not last_command:
-            await update.message.reply_text("❗️Нет предыдущей команды для повторения.")
+            await self.safe_reply_text(update, "❗️ Нет предыдущей команды для повторения.")
             return
-        active_session = self.sessions.get(user_id)
-        if active_session and not active_session.get("stop", True):
-            await update.message.reply_text("❗️Идентичный поиск уже выполняется.")
-            return
-        if last_command["type"] == "imgur":
-            context.args = [str(last_command["length"]), str(last_command["count"])]
-            await self.get_imgur_images(update, context)
-        elif last_command["type"] == "prnt":
-            context.args = [str(last_command["count"])]
-            await self.get_prnt_images(update, context)
-        elif last_command["type"] == "pastenow":
-            context.args = [str(last_command["count"])]
-            await self.get_pastenow_images(update, context)
-        elif last_command["type"] == "freeimage":
-            context.args = [str(last_command["count"])]
-            await self.get_freeimage_images(update, context)
-        elif last_command["type"] == "all":
-            context.args = [str(last_command["count"])]
-            await self.search_all_sources(update, context)
+            
+        async with self.lock:
+            if key in self.sessions:
+                current_session = self.sessions[key]
+                if (current_session["source_type"] == last_command["type"] and 
+                    current_session.get("length", 0) == last_command.get("length", 0) and 
+                    current_session["target_count"] == last_command["count"]):
+                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
+                    return
+                else:
+                    await self.stop(update, context, silent=True)
+                    await asyncio.sleep(1)
+            
+            if last_command["type"] == "imgur":
+                context.args = [str(last_command["length"]), str(last_command["count"])]
+                await self.get_imgur_images(update, context)
+            elif last_command["type"] == "prnt":
+                context.args = [str(last_command["count"])]
+                await self.get_prnt_images(update, context)
+            elif last_command["type"] == "pastenow":
+                context.args = [str(last_command["count"])]
+                await self.get_pastenow_images(update, context)
+            elif last_command["type"] == "freeimage":
+                context.args = [str(last_command["count"])]
+                await self.get_freeimage_images(update, context)
+            elif last_command["type"] == "all":
+                context.args = [str(last_command["count"])]
+                await self.search_all_sources(update, context)
+
+    async def update_status_message(self, key: Tuple[int, int], force: bool = False):
+        async with self.lock:
+            if key not in self.sessions:
+                return
+                
+            session = self.sessions[key]
+            
+            # Проверка блокировки обновлений из-за флуд-контроля
+            if not force and session.get('status_update_blocked_until', 0) > time.time():
+                return
+                
+            current_time = time.time()
+            session["last_update"] = current_time
+            self.sessions[key] = session
+            
+            status_msg = session.get("status_msg")
+            if not status_msg:
+                return
+                
+            try:
+                target = session["target_count"]
+                found = session.get("found", 0)
+                analyzed = session.get("analyzed", 0)
+                
+                source_name = {
+                    "imgur": f"Imgur ({session.get('length', 5)})",
+                    "prnt": "Prnt.sc",
+                    "pastenow": "Paste.pics",
+                    "freeimage": "Freeimage",
+                    "all": "Все источники"
+                }.get(session["source_type"], "Неизвестный источник")
+                
+                text = (
+                    f"🔍 Поиск {source_name} в процессе\n"
+                    f"Цель: {target} изображений\n"
+                    f"Найдено: {found}/{target}\n"
+                    f"Проверено: {analyzed}\n"
+                    f"Время: {format_time(int(current_time - session['start_time']))}"
+                )
+                
+                await status_msg.edit_text(text)
+            except RetryAfter as e:
+                logger.warning(f"Flood control при обновлении статуса для {key}. Ожидание {e.retry_after} секунд")
+                async with self.lock:
+                    if key in self.sessions:
+                        self.sessions[key]['status_update_blocked_until'] = time.time() + e.retry_after
+            except Exception as e:
+                logger.error(f"Ошибка при обновлении статуса для {key}: {str(e)}")
 
     async def handle_flood_control(self, update, retry_in, scope="imgur"):
         now = time.time()
         retry_with_reserve = add_flood_control_reserve(retry_in)
         self.flood_lock[scope] = now + retry_with_reserve
-        formatted_time = format_time_full(retry_with_reserve)
-        logger.warning(f"Flood control: ожидание {retry_with_reserve} секунд (до {time.ctime(self.flood_lock[scope])})")
-        await update.message.reply_text(
-            f"⚠️ Flood control! Поиск приостановлен примерно на {formatted_time}.\n"
-            f"Пожалуйста, подождите, бот занят или превысил лимит запросов."
-        )
+        formatted_time = format_time(retry_with_reserve)
+        logger.warning(f"Flood control: ожидание {retry_with_reserve} секунд")
+        await self.safe_reply_text(update, f"⚠️ Flood control! Поиск приостановлен примерно на {formatted_time}.")
         await asyncio.sleep(retry_with_reserve)
 
     def is_locked_by_flood(self, scope="imgur"):
         now = time.time()
         return (scope in self.flood_lock) and (self.flood_lock[scope] > now)
+    
+    def is_source_disabled(self, source: str) -> bool:
+        if source in self.source_errors:
+            return (time.time() - self.source_errors[source]) < SOURCE_TIMEOUT
+        return False
 
     async def search_all_sources(self, update: Update, context: CallbackContext):
-        user_id = update.effective_user.id
+        key = self.get_key(update)
         
-        if await self.check_cooldown(update, user_id):
+        if await self.check_cooldown(update):
             return
             
         args = context.args
-        
         if len(args) != 1:
-            await update.message.reply_text("Используйте: /getall <1-50>")
+            await self.safe_reply_text(update, "Используйте: /getall <1-50>")
             return
 
         try:
             count = int(args[0])
         except ValueError:
-            await update.message.reply_text("Количество должно быть числом")
+            await self.safe_reply_text(update, "Количество должно быть числом")
             return
 
         if not 1 <= count <= 50:
-            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
+            await self.safe_reply_text(update, "Можно запросить от 1 до 50 изображений за раз")
             return
 
-        last_command = self.last_commands.get(user_id)
-        active_session = self.sessions.get(user_id)
-        if (
-            active_session and not active_session.get("stop", True)
-            and last_command
-            and last_command["type"] == "all"
-            and last_command["count"] == count
-        ):
-            await update.message.reply_text("❗️Идентичный поиск уже выполняется.")
-            return
-
-        if active_session and active_session.get("task"):
-            active_session["stop"] = True
-            old_task = active_session["task"]
-            try:
-                old_task.cancel()
-                await old_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Ошибка при завершении предыдущего поиска: {str(e)}")
-            self.cleanup_user_session(user_id)
-
-        self.command_cooldowns[user_id] = time.time()
-        
-        self.last_commands[user_id] = {
-            "type": "all",
-            "count": count,
-            "timestamp": time.time()
-        }
-
-        start_time = time.time()
-        analyzed = {"imgur5": 0, "imgur7": 0, "prnt": 0, "pastenow": 0, "freeimage": 0}
-        found = 0
-        last_found_time = time.time()
-        last_status_update = 0
-        max_per_source = min(20, count)
-
-        logger.info(f"Поиск по всем источникам для пользователя {user_id} начат. Цель: {count} изображений")
-
-        status_msg = await update.message.reply_text(
-            f"🔍 Поиск во всех источниках начат\n"
-            f"Цель: {count} изображений\n"
-            f"Найдено: 0/{count}\n"
-            f"Проверено: 0\n"
-            f"Время: 0с"
-        )
-
-        async def update_status(force=False):
-            nonlocal last_status_update
-            current_time = time.time()
-            if force or current_time - last_status_update >= 10:
-                elapsed = int(current_time - start_time)
-                total_analyzed = sum(analyzed.values())
-                await status_msg.edit_text(
-                    f"🔍 Поиск во всех источниках\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено: {found}/{count}\n"
-                    f"Проверено: {total_analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                last_status_update = current_time
-
-        async def search_imgur(length: int, session: Dict, max_count: int):
-            nonlocal found, analyzed
-            source_key = f"imgur{length}"
-            current_found = 0
-            
-            while (not session.get("stop", False) and 
-                   found < count and 
-                   current_found < max_count and
-                   current_found < max_per_source):
-                
-                if self.is_locked_by_flood("imgur"):
-                    wait_sec = int(self.flood_lock["imgur"] - time.time())
-                    await update.message.reply_text(
-                        f"🔒 Imgur временно заблокирован из-за flood control!\n"
-                        f"Осталось ждать: {format_time_full(wait_sec)}."
-                    )
-                    await asyncio.sleep(wait_sec)
-                    continue
-                
-                tasks = []
-                for _ in range(5 if length == 5 else 3):
-                    code = self.generate_random_string(length)
-                    url = f"https://i.imgur.com/{code}.jpg"
-                    tasks.append(self.check_image_async(url, "imgur"))
-                
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                for result in results:
-                    if session.get("stop", False) or found >= count or current_found >= max_count or current_found >= max_per_source:
-                        break
-                    
-                    if isinstance(result, FloodControlException):
-                        await self.handle_flood_control(update, result.retry_in, "imgur")
-                        break
-                    
-                    if isinstance(result, Exception):
-                        msg = str(result)
-                        if "Flood control exceeded" in msg and "Retry in " in msg:
-                            try:
-                                retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
-                                await self.handle_flood_control(update, retry_in, "imgur")
-                                break
-                            except Exception:
-                                pass
-                        logger.error(f"Ошибка в check_image_async (imgur): {result}")
-                        continue
-                    
-                    url, ext = result
-                    analyzed[source_key] += 1
-                    
-                    if ext:
-                        found += 1
-                        current_found += 1
-                        last_found_time = time.time()
-                        session["last_found_time"] = last_found_time
-                        await self.add_to_media_group(
-                            update, user_id, url, ext, count, found, f"imgur{length}"
-                        )
-                
-                await update_status()
-                await asyncio.sleep(1)
-
-        async def search_prnt(session: Dict, max_count: int):
-            nonlocal found, analyzed
-            current_found = 0
-            
-            while (not session.get("stop", False) and 
-                   found < count and 
-                   current_found < max_count and
-                   current_found < max_per_source):
-                
-                if self.is_locked_by_flood("prnt"):
-                    wait_sec = int(self.flood_lock["prnt"] - time.time())
-                    await update.message.reply_text(
-                        f"🔒 Prnt.sc временно заблокирован из-за flood control!\n"
-                        f"Осталось ждать: {format_time_full(wait_sec)}."
-                    )
-                    await asyncio.sleep(wait_sec)
-                    continue
-                
-                tasks = []
-                for _ in range(5):
-                    code = self.generate_random_string(6)
-                    tasks.append(self.extract_prnt_image_url_async(code))
-                
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                for result in results:
-                    if session.get("stop", False) or found >= count or current_found >= max_count or current_found >= max_per_source:
-                        break
-                    
-                    if isinstance(result, FloodControlException):
-                        await self.handle_flood_control(update, result.retry_in, "prnt")
-                        break
-                    
-                    if isinstance(result, Exception):
-                        msg = str(result)
-                        if "Flood control exceeded" in msg and "Retry in " in msg:
-                            try:
-                                retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
-                                await self.handle_flood_control(update, retry_in, "prnt")
-                                break
-                            except Exception:
-                                pass
-                        logger.error(f"Ошибка в extract_prnt_image_url_async: {result}")
-                        continue
-                    
-                    img_url = result
-                    analyzed["prnt"] += 1
-                    
-                    if img_url:
-                        ext = await self.check_image_async(img_url, "prnt")
-                        if isinstance(ext, FloodControlException):
-                            await self.handle_flood_control(update, ext.retry_in, "prnt")
-                            break
-                        
-                        if ext and ext[1]:
-                            found += 1
-                            current_found += 1
-                            last_found_time = time.time()
-                            session["last_found_time"] = last_found_time
-                            await self.add_to_media_group(
-                                update, user_id, img_url, ext[1], count, found, "prnt"
-                            )
-                
-                await update_status()
-                await asyncio.sleep(1)
-
-        async def search_pastenow(session: Dict, max_count: int):
-            nonlocal found, analyzed
-            current_found = 0
-            
-            while (not session.get("stop", False) and 
-                   found < count and 
-                   current_found < max_count and
-                   current_found < max_per_source):
-                
-                if self.is_locked_by_flood("pastenow"):
-                    wait_sec = int(self.flood_lock["pastenow"] - time.time())
-                    await update.message.reply_text(
-                        f"🔒 Pastenow временно заблокирован из-за flood control!\n"
-                        f"Осталось ждать: {format_time_full(wait_sec)}."
-                    )
-                    await asyncio.sleep(wait_sec)
-                    continue
-                
-                tasks = []
-                for _ in range(10):
-                    code = self.generate_random_string(5)
-                    tasks.append(self.extract_pastenow_image_url_async(code))
-                
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                for result in results:
-                    if session.get("stop", False) or found >= count or current_found >= max_count or current_found >= max_per_source:
-                        break
-                    
-                    if isinstance(result, FloodControlException):
-                        await self.handle_flood_control(update, result.retry_in, "pastenow")
-                        break
-                    
-                    if isinstance(result, Exception):
-                        msg = str(result)
-                        if "timeout" in msg.lower() or "time out" in msg.lower():
-                            await update.message.reply_text("❗️Ошибка таймаута на pastenow, жду 60 секунд, продолжаю поиск.")
-                            await asyncio.sleep(60)
-                            continue
-                        if "Flood control exceeded" in msg and "Retry in " in msg:
-                            try:
-                                retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
-                                await self.handle_flood_control(update, retry_in, "pastenow")
-                                break
-                            except Exception:
-                                pass
-                        logger.error(f"Ошибка в extract_pastenow_image_url_async: {result}")
-                        continue
-                    
-                    img_url = result
-                    analyzed["pastenow"] += 1
-                    
-                    if img_url:
-                        ext = await self.check_image_async(img_url, "pastenow")
-                        if isinstance(ext, FloodControlException):
-                            await self.handle_flood_control(update, ext.retry_in, "pastenow")
-                            break
-                        
-                        if ext and ext[1]:
-                            found += 1
-                            current_found += 1
-                            last_found_time = time.time()
-                            session["last_found_time"] = last_found_time
-                            await self.add_to_media_group(
-                                update, user_id, img_url, ext[1], count, found, "pastenow"
-                            )
-                
-                await update_status()
-                await asyncio.sleep(1)
-
-        async def search_freeimage(session: Dict, max_count: int):
-            nonlocal found, analyzed
-            current_found = 0
-            
-            while (not session.get("stop", False) and 
-                   found < count and 
-                   current_found < max_count and
-                   current_found < max_per_source):
-                
-                if self.is_locked_by_flood("freeimage"):
-                    wait_sec = int(self.flood_lock["freeimage"] - time.time())
-                    await update.message.reply_text(
-                        f"🔒 Freeimage временно заблокирован из-за flood control!\n"
-                        f"Осталось ждать: {format_time_full(wait_sec)}."
-                    )
-                    await asyncio.sleep(wait_sec)
-                    continue
-                
-                tasks = []
-                for _ in range(10):
-                    code = self.generate_random_string(7)
-                    url = f"https://iili.io/{code}.jpg"
-                    tasks.append(self.check_image_async(url, "freeimage"))
-                
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                for result in results:
-                    if session.get("stop", False) or found >= count or current_found >= max_count or current_found >= max_per_source:
-                        break
-                    
-                    if isinstance(result, FloodControlException):
-                        await self.handle_flood_control(update, result.retry_in, "freeimage")
-                        break
-                    
-                    if isinstance(result, Exception):
-                        msg = str(result)
-                        if "timeout" in msg.lower() or "time out" in msg.lower():
-                            await update.message.reply_text("❗️Ошибка таймаута на freeimage, жду 60 секунд, продолжаю поиск.")
-                            await asyncio.sleep(60)
-                            continue
-                        if "Flood control exceeded" in msg and "Retry in " in msg:
-                            try:
-                                retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
-                                await self.handle_flood_control(update, retry_in, "freeimage")
-                                break
-                            except Exception:
-                                pass
-                        logger.error(f"Ошибка в check_image_async (freeimage): {result}")
-                        continue
-                    
-                    url, ext = result
-                    analyzed["freeimage"] += 1
-                    
-                    if ext:
-                        found += 1
-                        current_found += 1
-                        last_found_time = time.time()
-                        session["last_found_time"] = last_found_time
-                        await self.add_to_media_group(
-                            update, user_id, url, ext, count, found, "freeimage"
-                        )
-                
-                await update_status()
-                await asyncio.sleep(1)
-
-        async def search_loop():
-            nonlocal found, analyzed
-            timeout_task = None
-            try:
-                session = self.sessions.get(user_id)
-                if not session:
+        async with self.lock:
+            if key in self.sessions:
+                current_session = self.sessions[key]
+                if current_session["source_type"] == "all" and current_session["target_count"] == count:
+                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
                     return
-                
-                session["actual_found"] = 0
-                session["_real_sent_ids"] = set()
-                session["last_found_time"] = time.time()
-                timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
-                remaining = count
-                sources = [
-                    ("imgur5", lambda: search_imgur(5, session, min(remaining, max_per_source))),
-                    ("imgur7", lambda: search_imgur(7, session, min(remaining, max_per_source))),
-                    ("prnt", lambda: search_prnt(session, min(remaining, max_per_source))),
-                    ("pastenow", lambda: search_pastenow(session, min(remaining, max_per_source))),
-                    ("freeimage", lambda: search_freeimage(session, min(remaining, max_per_source)))
-                ]
-        
-                tasks = []
-                for source_name, search_func in sources:
-                    if found >= count or session.get("stop", False):
-                        break
-                    tasks.append(asyncio.create_task(search_func()))
-                
-                await asyncio.gather(*tasks)
-                
-            except asyncio.CancelledError:
-                logger.info(f"Поиск по всем источникам для пользователя {user_id} отменён")
-            except Exception as e:
-                logger.error(f"Ошибка в поиске по всем источникам для пользователя {user_id}: {str(e)}")
-                await asyncio.sleep(10)
-            finally:
-                if timeout_task:
-                    timeout_task.cancel()
-                    try:
-                        await timeout_task
-                    except:
-                        pass
-                
-                actual_found = 0
-                if user_id in self.sent_image_ids:
-                    session_sent = session.get("_session_sent_ids", set())
-                    actual_found = len(session_sent)
-                
-                if user_id in self.media_groups and self.media_groups[user_id]:
-                    new_media = []
-                    for media in self.media_groups[user_id]:
-                        image_id = self.extract_image_id(media.caption)
-                        if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
-                            new_media.append(media)
-                    if new_media:
-                        logger.info(f"Финальная отправка {len(new_media)} изображений пользователю {user_id}")
-                        await self.send_media_group(update, new_media, user_id)
-                        actual_found += len([m for m in new_media if self.extract_image_id(m.caption) not in self.sent_image_ids.get(user_id, set())])
-                
-                elapsed = int(time.time() - start_time)
-                total_analyzed = sum(analyzed.values())
-                
-                logger.info(
-                    f"Поиск по всем источникам для пользователя {user_id} завершён. "
-                    f"Цель: {count}, найдено: {actual_found}, проверено: {total_analyzed}, "
-                    f"время: {self.format_time(elapsed)}\n"
-                    f"Детали: Imgur5: {analyzed['imgur5']}, Imgur7: {analyzed['imgur7']}, "
-                    f"Prnt: {analyzed['prnt']}, Pastenow: {analyzed['pastenow']}, "
-                    f"Freeimage: {analyzed['freeimage']}"
-                )
-                
-                await update.message.reply_text(
-                    f"✅ Поиск всех источников завершён\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено уникальных: {actual_found}/{count}\n"
-                    f"Проверено: {total_analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                
-                self.cleanup_user_session(user_id)
+                else:
+                    await self.stop(update, context, silent=True)
+                    await asyncio.sleep(1)
+            
+            logger.info(f"Поиск по всем источникам начат для пользователя {key}. Цель: {count} изображений")
+            
+            self.last_commands[key] = {
+                "type": "all",
+                "count": count,
+                "timestamp": time.time()
+            }
 
-        task = asyncio.create_task(search_loop())
-        self.sessions[user_id] = {
-            "task": task,
-            "stop": False,
-            "start_time": start_time,
-            "analyzed": analyzed,
-            "found": found,
-            "count": count,
-            "status_msg": status_msg,
-            "actual_found": 0,
-            "last_found_time": time.time()
-        }
+            status_msg = await update.message.reply_text(
+                f"🔍 Поиск всех источников начат\n"
+                f"Цель: {count} изображений\n"
+                f"Найдено: 0/{count}\n"
+                f"Проверено: 0\n"
+                f"Время: 0с"
+            )
+            
+            self.sessions[key] = {
+                "tasks": [],
+                "stop": False,
+                "start_time": time.time(),
+                "last_update": time.time(),
+                "last_found_time": time.time(),
+                "status_msg": status_msg,
+                "target_count": count,
+                "found": 0,
+                "analyzed": 0,
+                "source_type": "all",
+                "sources": {
+                    "imgur5": {"active": True, "found": 0},
+                    "imgur7": {"active": True, "found": 0},
+                    "prnt": {"active": True, "found": 0},
+                    "pastenow": {"active": True, "found": 0},
+                    "freeimage": {"active": True, "found": 0}
+                }
+            }
+            
+            self.command_cooldowns[key] = time.time()
+
+        await self.show_main_menu(update)
+        
+        asyncio.create_task(self._search_all_sources(update, key, count))
+
+    async def _search_all_sources(self, update: Update, key: Tuple[int, int], count: int):
+        async def search_source(source_type: str, length: int = None):
+            nonlocal session
+            batch_size = BATCH_SIZES[source_type]
+            weight = SOURCE_WEIGHTS[source_type]
+            max_per_source = min(50, max(1, round(weight * count * 1.5)))
+            last_update_time = time.time()
+            
+            while not session.get("stop", False):
+                async with self.lock:
+                    if session["found"] >= count:
+                        break
+                        
+                if session["sources"][source_type]["found"] >= max_per_source:
+                    break
+                    
+                if self.is_locked_by_flood(source_type):
+                    wait_sec = int(self.flood_lock[source_type] - time.time())
+                    if wait_sec > 0:
+                        await asyncio.sleep(wait_sec)
+                    continue
+                
+                if self.is_source_disabled(source_type):
+                    logger.info(f"Источник {source_type} временно отключен")
+                    async with self.lock:
+                        session["sources"][source_type]["active"] = False
+                        self.sessions[key] = session
+                    break
+                
+                urls_to_check = []
+                for _ in range(batch_size):
+                    if source_type in ["imgur5", "imgur7"]:
+                        code = self.generate_random_string(length)
+                        urls_to_check.append(f"https://i.imgur.com/{code}.jpg")
+                    elif source_type == "prnt":
+                        code = self.generate_random_string(6)
+                        urls_to_check.append(code)
+                    elif source_type == "pastenow":
+                        code = self.generate_random_string(5)
+                        urls_to_check.append(code)
+                    elif source_type == "freeimage":
+                        code = self.generate_random_string(7)
+                        urls_to_check.append(f"https://iili.io/{code}.jpg")
+                
+                try:
+                    tasks = []
+                    for url_or_code in urls_to_check:
+                        if source_type in ["imgur5", "imgur7", "freeimage"]:
+                            tasks.append(self.check_image(url_or_code, source_type))
+                        elif source_type == "prnt":
+                            tasks.append(self.extract_prnt_image_url(url_or_code))
+                        elif source_type == "pastenow":
+                            tasks.append(self.extract_pastenow_image_url(url_or_code))
+                    
+                    results = await asyncio.gather(*tasks)
+                    
+                    for result in results:
+                        async with self.lock:
+                            session["analyzed"] += 1
+                            analyzed = session["analyzed"]
+                            self.sessions[key] = session
+                        
+                        if analyzed % UPDATE_ON_CHECKED == 0:
+                            await self.update_status_message(key, force=True)
+                        
+                        if source_type in ["imgur5", "imgur7", "freeimage"]:
+                            url, ext = result
+                            if not ext:
+                                continue
+                        else:
+                            url = result
+                            if not url:
+                                continue
+                            _, ext = await self.check_image(url, source_type)
+                            if not ext:
+                                continue
+                        
+                        async with self.lock:
+                            session["found"] += 1
+                            session["sources"][source_type]["found"] += 1
+                            session["last_found_time"] = time.time()
+                            found = session["found"]
+                            self.sessions[key] = session
+                            
+                        await self.add_to_media_group(
+                            update, key, url, ext, count, found, source_type
+                        )
+                        
+                        if found % UPDATE_ON_FOUND == 0:
+                            await self.update_status_message(key, force=True)
+                        
+                        if session["found"] >= count:
+                            break
+                    
+                    current_time = time.time()
+                    if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
+                        await self.update_status_message(key)
+                        last_update_time = current_time
+                    
+                    await asyncio.sleep(0.5)
+                    
+                except FloodControlException as fce:
+                    await self.handle_flood_control(update, fce.retry_in, source_type)
+                except Exception as e:
+                    logger.error(f"Ошибка при поиске в {source_type}: {str(e)}")
+                    async with self.lock:
+                        session["sources"][source_type]["active"] = False
+                        self.sessions[key] = session
+                    break
+        
+        try:
+            async with self.lock:
+                session = self.sessions[key]
+            
+            tasks = []
+            if not self.is_source_disabled("imgur5"):
+                tasks.append(asyncio.create_task(search_source("imgur5", 5)))
+            if not self.is_source_disabled("imgur7"):
+                tasks.append(asyncio.create_task(search_source("imgur7", 7)))
+            if not self.is_source_disabled("prnt"):
+                tasks.append(asyncio.create_task(search_source("prnt")))
+            if not self.is_source_disabled("pastenow"):
+                tasks.append(asyncio.create_task(search_source("pastenow")))
+            if not self.is_source_disabled("freeimage"):
+                tasks.append(asyncio.create_task(search_source("freeimage")))
+            
+            async with self.lock:
+                session["tasks"] = tasks
+                self.sessions[key] = session
+            
+            await asyncio.gather(*tasks)
+            
+        except asyncio.CancelledError:
+            logger.info(f"Поиск всех источников для пользователя {key} отменен")
+        except Exception as e:
+            logger.error(f"Ошибка при поиске всех источников: {str(e)}")
+        finally:
+            if key in self.media_groups and self.media_groups[key]:
+                media_to_send = self.media_groups[key]
+                self.media_groups[key] = []
+                await self.send_media_group(update, media_to_send, key)
+            
+            async with self.lock:
+                if key in self.sessions:
+                    session = self.sessions[key]
+                    elapsed = int(time.time() - session["start_time"])
+                    target = session["target_count"]
+                    found = session.get("found", 0)
+                    analyzed = session.get("analyzed", 0)
+                    
+                    logger.info(
+                        f"Поиск по всем источникам завершен для пользователя {key}. "
+                        f"Найдено: {found}/{target}, Проверено: {analyzed}, Время: {elapsed}с"
+                    )
+                    
+                    message = (
+                        f"✅ Поиск всех источников завершен\n"
+                        f"Цель: {target} изображений\n"
+                        f"Найдено: {found}/{target}\n"
+                        f"Проверено: {analyzed}\n"
+                        f"Время: {format_time(elapsed)}"
+                    )
+                    
+                    await self.safe_reply_text(update, message)
+                    
+                    self.cleanup_user_session(key)
+                    await self.show_main_menu(update)
 
     async def get_imgur_images(self, update: Update, context: CallbackContext):
-        user_id = update.effective_user.id
+        key = self.get_key(update)
         
-        if await self.check_cooldown(update, user_id):
+        if await self.check_cooldown(update):
             return
             
         args = context.args
         if len(args) != 2:
-            await update.message.reply_text("Используйте: /getimg <5|7> <1-50>")
+            await self.safe_reply_text(update, "Используйте: /getimg <5|7> <1-50>")
             return
 
         try:
             length = int(args[0])
             count = int(args[1])
         except ValueError:
-            await update.message.reply_text("Длина и количество должны быть числами")
+            await self.safe_reply_text(update, "Длина и количество должны быть числами")
             return
 
         if length not in [5, 7]:
-            await update.message.reply_text("Длина может быть только 5 или 7 символов")
+            await self.safe_reply_text(update, "Длина может быть только 5 или 7 символов")
             return
 
         if not 1 <= count <= 50:
-            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
+            await self.safe_reply_text(update, "Можно запросить от 1 до 50 изображений за раз")
             return
 
-        if self.is_locked_by_flood("imgur"):
-            wait_sec = int(self.flood_lock["imgur"] - time.time())
-            await update.message.reply_text(
-                f"🔒 Поиск временно заблокирован из-за flood control!\n"
-                f"Осталось ждать: {format_time_full(wait_sec)}."
-            )
-            return
-
-        last_command = self.last_commands.get(user_id)
-        active_session = self.sessions.get(user_id)
-        if (
-            active_session and not active_session.get("stop", True)
-            and last_command
-            and last_command["type"] == "imgur"
-            and last_command["length"] == length
-            and last_command["count"] == count
-        ):
-            await update.message.reply_text("❗️Идентичный поиск уже выполняется.")
-            return
-
-        if active_session and active_session.get("task"):
-            active_session["stop"] = True
-            old_task = active_session["task"]
-            try:
-                old_task.cancel()
-                await old_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Ошибка при завершении предыдущего поиска: {str(e)}")
-            self.cleanup_user_session(user_id)
-
-        self.last_commands[user_id] = {
-            "type": "imgur",
-            "length": length,
-            "count": count,
-            "timestamp": time.time()
-        }
-
-        start_time = time.time()
-        analyzed = 0
-        found = 0
-        last_found_time = time.time()
-        last_status_update = 0
-
-        logger.info(f"Imgur поиск пользователя {user_id} начат. Длина: {length}, количество: {count}")
-
-        status_msg = await update.message.reply_text(
-            f"🔍 Поиск Imgur начат\n"
-            f"Длина: {length}\n"
-            f"Цель: {count} изображений\n"
-            f"Найдено: 0/{count}\n"
-            f"Проверено: 0\n"
-            f"Время: 0с"
-        )
-        self.command_cooldowns[user_id] = time.time()
-
-        async def update_status(force=False):
-            nonlocal last_status_update
-            current_time = time.time()
-            if force or current_time - last_status_update >= 10:
-                elapsed = int(current_time - start_time)
-                await status_msg.edit_text(
-                    f"🔍 Поиск Imgur\n"
-                    f"Длина: {length}\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено: {found}/{count}\n"
-                    f"Проверено: {analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                last_status_update = current_time
-
-        async def search_loop():
-            nonlocal analyzed, found, last_found_time
-            timeout_task = None
-            try:
-                session = self.sessions.get(user_id)
-                if not session:
+        async with self.lock:
+            if key in self.sessions:
+                current_session = self.sessions[key]
+                if current_session["source_type"] == "imgur" and current_session.get("length", 0) == length and current_session["target_count"] == count:
+                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
                     return
-                session["actual_found"] = 0
-                session["_real_sent_ids"] = set()
-                session["last_found_time"] = time.time()
-                timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
-                last_status_update = 0
-                last_progress_analyzed = 0
-                while session.get("actual_found", 0) < count and not session.get("stop", False):
-                    if self.is_locked_by_flood("imgur"):
-                        wait_sec = int(self.flood_lock["imgur"] - time.time())
-                        await update.message.reply_text(
-                            f"🔒 Поиск временно заблокирован из-за flood control!\n"
-                            f"Осталось ждать: {format_time_full(wait_sec)}."
-                        )
-                        await asyncio.sleep(wait_sec)
-                        continue
-                    tasks = []
-                    for _ in range(10):
-                        code = self.generate_random_string(length)
-                        url = f"https://i.imgur.com/{code}.jpg"
-                        tasks.append(self.check_image_async(url, "imgur"))
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for result in results:
-                        session = self.sessions.get(user_id)
-                        if not session or session.get("stop", False):
-                            break
-                        if session.get("stop", False) or session.get("actual_found", 0) >= count:
-                            break
-                        if isinstance(result, FloodControlException):
-                            await self.handle_flood_control(update, result.retry_in, "imgur")
-                            break
-                        if isinstance(result, Exception):
-                            msg = str(result)
-                            if "Flood control exceeded" in msg and "Retry in " in msg:
-                                try:
-                                    retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
-                                    await self.handle_flood_control(update, retry_in, "imgur")
-                                    break
-                                except Exception:
-                                    pass
-                            logger.error(f"Ошибка в check_image_async: {result}")
-                            continue
-                        url, ext = result
-                        analyzed += 1
-                        session["analyzed"] = analyzed
-                        if ext:
-                            found += 1
-                            last_found_time = time.time()
-                            session["found"] = found
-                            session["last_found_time"] = last_found_time
-                            await self.add_to_media_group(
-                                update, user_id, url, ext, count, found, "imgur"
-                            )
-                        if analyzed - last_progress_analyzed >= 10:
-                            await update_status()
-                            last_progress_analyzed = analyzed
-                    await update_status()
+                else:
+                    await self.stop(update, context, silent=True)
                     await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                logger.info(f"Поиск Imgur для пользователя {user_id} отменён")
-            except Exception as e:
-                logger.error(f"Ошибка в поиске Imgur для пользователя {user_id}: {str(e)}")
-                await asyncio.sleep(10)
-            finally:
-                if timeout_task:
-                    timeout_task.cancel()
-                    try:
-                        await timeout_task
-                    except:
-                        pass
-                session = self.sessions.get(user_id, {})
-                actual_found = session.get("actual_found", 0)
-                if user_id in self.media_groups and self.media_groups[user_id]:
-                    new_media = []
-                    for media in self.media_groups[user_id]:
-                        image_id = self.extract_image_id(media.caption)
-                        if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
-                            new_media.append(media)
-                    if new_media:
-                        logger.info(f"Финальная отправка {len(new_media)} изображений пользователю {user_id}")
-                        await self.send_media_group(update, new_media, user_id)
-                elapsed = int(time.time() - start_time)
-                logger.info(
-                    f"Imgur поиск пользователя {user_id} завершён. "
-                    f"Длина: {length}, количество: {count}, "
-                    f"найдено: {actual_found}, проверено: {analyzed}, "
-                    f"время: {self.format_time(elapsed)}"
-                )
-                await update.message.reply_text(
-                    f"✅ Поиск Imgur завершён\n"
-                    f"Длина: {length}\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено уникальных: {actual_found}/{count}\n"
-                    f"Проверено: {analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                self.cleanup_user_session(user_id)
+                    
+            self.last_commands[key] = {
+                "type": "imgur",
+                "length": length,
+                "count": count,
+                "timestamp": time.time()
+            }
 
-        task = asyncio.create_task(search_loop())
-        self.sessions[user_id] = {
-            "task": task,
-            "stop": False,
-            "start_time": start_time,
-            "analyzed": analyzed,
-            "found": found,
-            "length": length,
-            "count": count,
-            "status_msg": status_msg,
-            "actual_found": 0,
-            "last_found_time": time.time()
-        }
+            status_msg = await update.message.reply_text(
+                f"🔍 Поиск Imgur начат\n"
+                f"Длина: {length}\n"
+                f"Цель: {count} изображений\n"
+                f"Найдено: 0/{count}\n"
+                f"Проверено: 0\n"
+                f"Время: 0с"
+            )
+            
+            self.sessions[key] = {
+                "task": None,
+                "stop": False,
+                "start_time": time.time(),
+                "last_update": time.time(),
+                "last_found_time": time.time(),
+                "status_msg": status_msg,
+                "target_count": count,
+                "found": 0,
+                "analyzed": 0,
+                "source_type": "imgur",
+                "length": length
+            }
+            
+            self.command_cooldowns[key] = time.time()
+
+        await self.show_main_menu(update)
+        
+        asyncio.create_task(self._search_imgur(update, key, length, count))
+
+    async def _search_imgur(self, update: Update, key: Tuple[int, int], length: int, count: int):
+        try:
+            async with self.lock:
+                session = self.sessions[key]
+                session["task"] = asyncio.current_task()
+                self.sessions[key] = session
+            
+            last_update_time = time.time()
+            
+            while not session.get("stop", False) and session["found"] < count:
+                if self.is_locked_by_flood("imgur"):
+                    wait_sec = int(self.flood_lock["imgur"] - time.time())
+                    if wait_sec > 0:
+                        await asyncio.sleep(wait_sec)
+                    continue
+                
+                code = self.generate_random_string(length)
+                url = f"https://i.imgur.com/{code}.jpg"
+                
+                try:
+                    _, ext = await self.check_image(url, "imgur")
+                    
+                    async with self.lock:
+                        session["analyzed"] += 1
+                        analyzed = session["analyzed"]
+                        self.sessions[key] = session
+                    
+                    if analyzed % UPDATE_ON_CHECKED == 0:
+                        await self.update_status_message(key, force=True)
+                    
+                    current_time = time.time()
+                    if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
+                        await self.update_status_message(key)
+                        last_update_time = current_time
+                    
+                    if ext:
+                        async with self.lock:
+                            session["found"] += 1
+                            session["last_found_time"] = time.time()
+                            found = session["found"]
+                            self.sessions[key] = session
+                        
+                        await self.add_to_media_group(
+                            update, key, url, ext, count, found, "imgur"
+                        )
+                        
+                        if found % UPDATE_ON_FOUND == 0:
+                            await self.update_status_message(key, force=True)
+                        
+                        if session["found"] >= count:
+                            break
+                    
+                    await asyncio.sleep(0.5)
+                    
+                except FloodControlException as fce:
+                    await self.handle_flood_control(update, fce.retry_in, "imgur")
+                except Exception as e:
+                    logger.error(f"Ошибка при проверке изображения Imgur: {str(e)}")
+            
+        except asyncio.CancelledError:
+            logger.info(f"Поиск Imgur для пользователя {key} отменен")
+        except Exception as e:
+            logger.error(f"Ошибка при поиске Imgur: {str(e)}")
+        finally:
+            if key in self.media_groups and self.media_groups[key]:
+                media_to_send = self.media_groups[key]
+                self.media_groups[key] = []
+                await self.send_media_group(update, media_to_send, key)
+            
+            async with self.lock:
+                if key in self.sessions:
+                    session = self.sessions[key]
+                    elapsed = int(time.time() - session["start_time"])
+                    target = session["target_count"]
+                    found = session.get("found", 0)
+                    analyzed = session.get("analyzed", 0)
+                    
+                    message = (
+                        f"✅ Поиск Imgur завершен\n"
+                        f"Длина: {length}\n"
+                        f"Цель: {target} изображений\n"
+                        f"Найдено: {found}/{target}\n"
+                        f"Проверено: {analyzed}\n"
+                        f"Время: {format_time(elapsed)}"
+                    )
+                    
+                    await self.safe_reply_text(update, message)
+                    
+                    self.cleanup_user_session(key)
+                    await self.show_main_menu(update)
 
     async def get_prnt_images(self, update: Update, context: CallbackContext):
-        user_id = update.effective_user.id
+        key = self.get_key(update)
         
-        if await self.check_cooldown(update, user_id):
+        if await self.check_cooldown(update):
             return
             
         args = context.args
         if len(args) != 1:
-            await update.message.reply_text("Используйте: /getprnt <1-50>")
+            await self.safe_reply_text(update, "Используйте: /getprnt <1-50>")
             return
 
         try:
             count = int(args[0])
         except ValueError:
-            await update.message.reply_text("Количество должно быть числом")
+            await self.safe_reply_text(update, "Количество должно быть числом")
             return
 
         if not 1 <= count <= 50:
-            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
+            await self.safe_reply_text(update, "Можно запросить от 1 до 50 изображений за раз")
             return
 
-        if self.is_locked_by_flood("prnt"):
-            wait_sec = int(self.flood_lock["prnt"] - time.time())
-            await update.message.reply_text(
-                f"🔒 Поиск временно заблокирован из-за flood control!\n"
-                f"Осталось ждать: {format_time_full(wait_sec)}."
-            )
-            return
-
-        last_command = self.last_commands.get(user_id)
-        active_session = self.sessions.get(user_id)
-        if (
-            active_session and not active_session.get("stop", True)
-            and last_command
-            and last_command["type"] == "prnt"
-            and last_command["count"] == count
-        ):
-            await update.message.reply_text("❗️Идентичный поиск уже выполняется.")
-            return
-
-        if active_session and active_session.get("task"):
-            active_session["stop"] = True
-            old_task = active_session["task"]
-            try:
-                old_task.cancel()
-                await old_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Ошибка при завершении предыдущего поиска: {str(e)}")
-            self.cleanup_user_session(user_id)
-
-        self.last_commands[user_id] = {
-            "type": "prnt",
-            "length": 6,
-            "count": count,
-            "timestamp": time.time()
-        }
-
-        length = 6
-        start_time = time.time()
-        analyzed = 0
-        found = 0
-        last_found_time = time.time()
-        last_status_update = 0
-
-        logger.info(f"Prnt.sc поиск пользователя {user_id} начат. Количество: {count}")
-
-        status_msg = await update.message.reply_text(
-            f"🔍 Поиск prnt.sc начат\n"
-            f"Длина: {length}\n"
-            f"Цель: {count} изображений\n"
-            f"Найдено: 0/{count}\n"
-            f"Проверено: 0\n"
-            f"Время: 0с"
-        )
-        self.command_cooldowns[user_id] = time.time()
-
-        async def update_status(force=False):
-            nonlocal last_status_update
-            current_time = time.time()
-            if force or current_time - last_status_update >= 10:
-                elapsed = int(current_time - start_time)
-                await status_msg.edit_text(
-                    f"🔍 Поиск prnt.sc\n"
-                    f"Длина: {length}\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено: {found}/{count}\n"
-                    f"Проверено: {analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                last_status_update = current_time
-
-        async def search_loop():
-            nonlocal analyzed, found, last_found_time
-            timeout_task = None
-            try:
-                session = self.sessions.get(user_id)
-                if not session:
+        async with self.lock:
+            if key in self.sessions:
+                current_session = self.sessions[key]
+                if current_session["source_type"] == "prnt" and current_session["target_count"] == count:
+                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
                     return
-                session["actual_found"] = 0
-                session["_real_sent_ids"] = set()
-                session["last_found_time"] = time.time()
-                timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
-                last_status_update = 0
-                last_progress_analyzed = 0
-                while session.get("actual_found", 0) < count and not session.get("stop", False):
-                    if self.is_locked_by_flood("prnt"):
-                        wait_sec = int(self.flood_lock["prnt"] - time.time())
-                        await update.message.reply_text(
-                            f"🔒 Поиск временно заблокирован из-за flood control!\n"
-                            f"Осталось ждать: {format_time_full(wait_sec)}."
-                        )
-                        await asyncio.sleep(wait_sec)
-                        continue
-                    tasks = []
-                    for _ in range(5):
-                        code = self.generate_random_string(length)
-                        tasks.append(self.extract_prnt_image_url_async(code))
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for result in results:
-                        session = self.sessions.get(user_id)
-                        if not session or session.get("stop", False):
-                            break
-                        if session.get("stop", False) or session.get("actual_found", 0) >= count:
-                            break
-                        if isinstance(result, FloodControlException):
-                            await self.handle_flood_control(update, result.retry_in, "prnt")
-                            break
-                        if isinstance(result, Exception):
-                            msg = str(result)
-                            if "Flood control exceeded" in msg and "Retry in " in msg:
-                                try:
-                                    retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
-                                    await self.handle_flood_control(update, retry_in, "prnt")
-                                    break
-                                except Exception:
-                                    pass
-                            logger.error(f"Ошибка в extract_prnt_image_url_async: {result}")
-                            continue
-                        img_url = result
-                        analyzed += 1
-                        session["analyzed"] = analyzed
-                        if img_url:
-                            ext = await self.check_image_async(img_url, "prnt")
-                            if isinstance(ext, FloodControlException):
-                                await self.handle_flood_control(update, ext.retry_in, "prnt")
-                                break
-                            if ext and ext[1]:
-                                found += 1
-                                last_found_time = time.time()
-                                session["found"] = found
-                                session["last_found_time"] = last_found_time
-                                await self.add_to_media_group(
-                                    update, user_id, img_url, ext[1], count, found, "prnt"
-                                )
-                        if analyzed - last_progress_analyzed >= 5:
-                            await update_status()
-                            last_progress_analyzed = analyzed
-                    await update_status()
+                else:
+                    await self.stop(update, context, silent=True)
                     await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                logger.info(f"Поиск prnt.sc для пользователя {user_id} отменён")
-            except Exception as e:
-                logger.error(f"Ошибка в поиске prnt.sc для пользователя {user_id}: {str(e)}")
-                await asyncio.sleep(10)
-            finally:
-                if timeout_task:
-                    timeout_task.cancel()
-                    try:
-                        await timeout_task
-                    except:
-                        pass
-                session = self.sessions.get(user_id, {})
-                actual_found = session.get("actual_found", 0)
-                if user_id in self.media_groups and self.media_groups[user_id]:
-                    new_media = []
-                    for media in self.media_groups[user_id]:
-                        image_id = self.extract_image_id(media.caption)
-                        if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
-                            new_media.append(media)
-                    if new_media:
-                        logger.info(f"Финальная отправка {len(new_media)} изображений пользователю {user_id}")
-                        await self.send_media_group(update, new_media, user_id)
-                elapsed = int(time.time() - start_time)
-                logger.info(
-                    f"Prnt.sc поиск пользователя {user_id} завершён. "
-                    f"Количество: {count}, найдено: {actual_found}, проверено: {analyzed}, время: {self.format_time(elapsed)}"
-                )
-                await update.message.reply_text(
-                    f"✅ Поиск prnt.sc завершён\n"
-                    f"Длина: {length}\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено уникальных: {actual_found}/{count}\n"
-                    f"Проверено: {analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                self.cleanup_user_session(user_id)
+                    
+            self.last_commands[key] = {
+                "type": "prnt",
+                "count": count,
+                "timestamp": time.time()
+            }
 
-        task = asyncio.create_task(search_loop())
-        self.sessions[user_id] = {
-            "task": task,
-            "stop": False,
-            "start_time": start_time,
-            "analyzed": analyzed,
-            "found": found,
-            "length": length,
-            "count": count,
-            "status_msg": status_msg,
-            "actual_found": 0,
-            "last_found_time": time.time()
-        }
+            status_msg = await update.message.reply_text(
+                f"🔍 Поиск prnt.sc начат\n"
+                f"Цель: {count} изображений\n"
+                f"Найдено: 0/{count}\n"
+                f"Проверено: 0\n"
+                f"Время: 0с"
+            )
+            
+            self.sessions[key] = {
+                "task": None,
+                "stop": False,
+                "start_time": time.time(),
+                "last_update": time.time(),
+                "last_found_time": time.time(),
+                "status_msg": status_msg,
+                "target_count": count,
+                "found": 0,
+                "analyzed": 0,
+                "source_type": "prnt"
+            }
+            
+            self.command_cooldowns[key] = time.time()
+
+        await self.show_main_menu(update)
+        
+        asyncio.create_task(self._search_prnt(update, key, count))
+
+    async def _search_prnt(self, update: Update, key: Tuple[int, int], count: int):
+        try:
+            async with self.lock:
+                session = self.sessions[key]
+                session["task"] = asyncio.current_task()
+                self.sessions[key] = session
+            
+            last_update_time = time.time()
+            
+            while not session.get("stop", False) and session["found"] < count:
+                if self.is_locked_by_flood("prnt"):
+                    wait_sec = int(self.flood_lock["prnt"] - time.time())
+                    if wait_sec > 0:
+                        await asyncio.sleep(wait_sec)
+                    continue
+                
+                if self.is_source_disabled("prnt"):
+                    logger.info("Источник prnt.sc временно отключен")
+                    async with self.lock:
+                        session["stop"] = True
+                        session["stop_reason"] = "source_disabled"
+                    break
+                
+                code = self.generate_random_string(6)
+                
+                try:
+                    url = await self.extract_prnt_image_url(code)
+                    if not url:
+                        continue
+                        
+                    _, ext = await self.check_image(url, "prnt")
+                    
+                    async with self.lock:
+                        session["analyzed"] += 1
+                        analyzed = session["analyzed"]
+                        self.sessions[key] = session
+                    
+                    if analyzed % UPDATE_ON_CHECKED == 0:
+                        await self.update_status_message(key, force=True)
+                    
+                    current_time = time.time()
+                    if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
+                        await self.update_status_message(key)
+                        last_update_time = current_time
+                    
+                    if ext:
+                        async with self.lock:
+                            session["found"] += 1
+                            session["last_found_time"] = time.time()
+                            found = session["found"]
+                            self.sessions[key] = session
+                            
+                        await self.add_to_media_group(
+                            update, key, url, ext, count, found, "prnt"
+                        )
+                        
+                        if found % UPDATE_ON_FOUND == 0:
+                            await self.update_status_message(key, force=True)
+                    
+                    await asyncio.sleep(0.5)
+                    
+                except FloodControlException as fce:
+                    await self.handle_flood_control(update, fce.retry_in, "prnt")
+                except Exception as e:
+                    logger.error(f"Ошибка при проверке изображения prnt.sc: {str(e)}")
+                    async with self.lock:
+                        session["stop"] = True
+                        session["stop_reason"] = "source_disabled"
+                    break
+            
+        except asyncio.CancelledError:
+            logger.info(f"Поиск prnt.sc для пользователя {key} отменен")
+        except Exception as e:
+            logger.error(f"Ошибка при поиске prnt.sc: {str(e)}")
+        finally:
+            if key in self.media_groups and self.media_groups[key]:
+                media_to_send = self.media_groups[key]
+                self.media_groups[key] = []
+                await self.send_media_group(update, media_to_send, key)
+            
+            async with self.lock:
+                if key in self.sessions:
+                    session = self.sessions[key]
+                    elapsed = int(time.time() - session["start_time"])
+                    target = session["target_count"]
+                    found = session.get("found", 0)
+                    analyzed = session.get("analyzed", 0)
+                    stop_reason = session.get("stop_reason", "")
+                    
+                    if session.get("stop", False) and found < target:
+                        text = f"🔴 Поиск остановлен\n"
+                        if stop_reason == "source_disabled":
+                            text += "⚠️ Источник временно недоступен\n"
+                        text += (
+                            f"Цель: {target} изображений\n"
+                            f"Найдено: {found}/{target}\n"
+                            f"Проверено: {analyzed}\n"
+                            f"Время: {format_time(elapsed)}"
+                        )
+                    else:
+                        text = (
+                            f"✅ Поиск завершен\n"
+                            f"Цель: {target} изображений\n"
+                            f"Найдено: {found}/{target}\n"
+                            f"Проверено: {analyzed}\n"
+                            f"Время: {format_time(elapsed)}"
+                        )
+                    
+                    await self.safe_reply_text(update, text)
+                    
+                    self.cleanup_user_session(key)
+                    await self.show_main_menu(update)
 
     async def get_pastenow_images(self, update: Update, context: CallbackContext):
-        user_id = update.effective_user.id
+        key = self.get_key(update)
         
-        if await self.check_cooldown(update, user_id):
+        if await self.check_cooldown(update):
             return
-
+            
         args = context.args
         if len(args) != 1:
-            await update.message.reply_text("Используйте: /getpastenow <1-50>")
+            await self.safe_reply_text(update, "Используйте: /getpastenow <1-50>")
             return
 
         try:
             count = int(args[0])
         except ValueError:
-            await update.message.reply_text("Количество должно быть числом")
+            await self.safe_reply_text(update, "Количество должно быть числом")
             return
 
         if not 1 <= count <= 50:
-            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
+            await self.safe_reply_text(update, "Можно запросить от 1 до 50 изображений за раз")
             return
 
-        if self.is_locked_by_flood("pastenow"):
-            wait_sec = int(self.flood_lock["pastenow"] - time.time())
-            await update.message.reply_text(
-                f"🔒 Поиск временно заблокирован из-за flood control!\n"
-                f"Осталось ждать: {format_time_full(wait_sec)}."
-            )
-            return
-
-        last_command = self.last_commands.get(user_id)
-        active_session = self.sessions.get(user_id)
-        if (
-            active_session and not active_session.get("stop", True)
-            and last_command
-            and last_command["type"] == "pastenow"
-            and last_command["count"] == count
-        ):
-            await update.message.reply_text("❗️Идентичный поиск уже выполняется.")
-            return
-
-        if active_session and active_session.get("task"):
-            active_session["stop"] = True
-            old_task = active_session["task"]
-            try:
-                old_task.cancel()
-                await old_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Ошибка при завершении предыдущего поиска: {str(e)}")
-            self.cleanup_user_session(user_id)
-
-        self.last_commands[user_id] = {
-            "type": "pastenow",
-            "length": 5,
-            "count": count,
-            "timestamp": time.time()
-        }
-
-        length = 5
-        start_time = time.time()
-        analyzed = 0
-        found = 0
-        last_found_time = time.time()
-        last_status_update = 0
-
-        logger.info(f"Pastenow.ru поиск пользователя {user_id} начат. Количество: {count}")
-
-        status_msg = await update.message.reply_text(
-            f"🔍 Поиск pastenow.ru начат\n"
-            f"Длина: {length}\n"
-            f"Цель: {count} изображений\n"
-            f"Найдено: 0/{count}\n"
-            f"Проверено: 0\n"
-            f"Время: 0с"
-        )
-        
-        self.command_cooldowns[user_id] = time.time()
-
-        async def update_status(force=False):
-            nonlocal last_status_update
-            current_time = time.time()
-            if force or current_time - last_status_update >= 10:
-                elapsed = int(current_time - start_time)
-                await status_msg.edit_text(
-                    f"🔍 Поиск pastenow.ru\n"
-                    f"Длина: {length}\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено: {found}/{count}\n"
-                    f"Проверено: {analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                last_status_update = current_time
-
-        async def search_loop():
-            nonlocal analyzed, found, last_found_time
-            timeout_task = None
-            try:
-                session = self.sessions.get(user_id)
-                if not session:
+        async with self.lock:
+            if key in self.sessions:
+                current_session = self.sessions[key]
+                if current_session["source_type"] == "pastenow" and current_session["target_count"] == count:
+                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
                     return
-                session["actual_found"] = 0
-                session["_real_sent_ids"] = set()
-                session["last_found_time"] = time.time()
-                timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
-                last_status_update = 0
-                last_progress_analyzed = 0
-                while session.get("actual_found", 0) < count and not session.get("stop", False):
-                    if self.is_locked_by_flood("pastenow"):
-                        wait_sec = int(self.flood_lock["pastenow"] - time.time())
-                        await update.message.reply_text(
-                            f"🔒 Поиск временно заблокирован из-за flood control!\n"
-                            f"Осталось ждать: {format_time_full(wait_sec)}."
-                        )
-                        await asyncio.sleep(wait_sec)
-                        continue
-                    tasks = []
-                    for _ in range(10):
-                        code = self.generate_random_string(length)
-                        tasks.append(self.extract_pastenow_image_url_async(code))
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for result in results:
-                        session = self.sessions.get(user_id)
-                        if not session or session.get("stop", False):
-                            break
-                        if session.get("stop", False) or session.get("actual_found", 0) >= count:
-                            break
-                        if isinstance(result, FloodControlException):
-                            await self.handle_flood_control(update, result.retry_in, "pastenow")
-                            break
-                        if isinstance(result, Exception):
-                            msg = str(result)
-                            if "timeout" in msg.lower() or "time out" in msg.lower():
-                                await update.message.reply_text("❗️Ошибка таймаута на pastenow, жду 60 секунд, продолжаю поиск.")
-                                await asyncio.sleep(60)
-                                continue
-                            if "Flood control exceeded" in msg and "Retry in " in msg:
-                                try:
-                                    retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
-                                    await self.handle_flood_control(update, retry_in, "pastenow")
-                                    break
-                                except Exception:
-                                    pass
-                            logger.error(f"Ошибка в extract_pastenow_image_url_async: {result}")
-                            continue
-                        img_url = result
-                        analyzed += 1
-                        session["analyzed"] = analyzed
-                        if img_url:
-                            ext = await self.check_image_async(img_url, "pastenow")
-                            if isinstance(ext, FloodControlException):
-                                await self.handle_flood_control(update, ext.retry_in, "pastenow")
-                                break
-                            if ext and ext[1]:
-                                found += 1
-                                last_found_time = time.time()
-                                session["found"] = found
-                                session["last_found_time"] = last_found_time
-                                await self.add_to_media_group(
-                                    update, user_id, img_url, ext[1], count, found, "pastenow"
-                                )
-                        if analyzed - last_progress_analyzed >= 5:
-                            await update_status()
-                            last_progress_analyzed = analyzed
-                    await update_status()
+                else:
+                    await self.stop(update, context, silent=True)
                     await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                logger.info(f"Поиск pastenow.ru для пользователя {user_id} отменён")
-            except Exception as e:
-                logger.error(f"Ошибка в поиске pastenow.ru для пользователя {user_id}: {str(e)}")
-                await asyncio.sleep(10)
-            finally:
-                if timeout_task:
-                    timeout_task.cancel()
-                    try:
-                        await timeout_task
-                    except:
-                        pass
-                session = self.sessions.get(user_id, {})
-                actual_found = session.get("actual_found", 0)
-                if user_id in self.media_groups and self.media_groups[user_id]:
-                    new_media = []
-                    for media in self.media_groups[user_id]:
-                        image_id = self.extract_image_id(media.caption)
-                        if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
-                            new_media.append(media)
-                    if new_media:
-                        logger.info(f"Финальная отправка {len(new_media)} изображений пользователю {user_id}")
-                        await self.send_media_group(update, new_media, user_id)
-                elapsed = int(time.time() - start_time)
-                logger.info(
-                    f"Pastenow.ru поиск пользователя {user_id} завершён. "
-                    f"Количество: {count}, найдено: {actual_found}, проверено: {analyzed}, время: {self.format_time(elapsed)}"
-                )
-                await update.message.reply_text(
-                    f"✅ Поиск pastenow.ru завершён\n"
-                    f"Длина: {length}\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено уникальных: {actual_found}/{count}\n"
-                    f"Проверено: {analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                self.cleanup_user_session(user_id)
+                    
+            self.last_commands[key] = {
+                "type": "pastenow",
+                "count": count,
+                "timestamp": time.time()
+            }
 
-        task = asyncio.create_task(search_loop())
-        self.sessions[user_id] = {
-            "task": task,
-            "stop": False,
-            "start_time": start_time,
-            "analyzed": analyzed,
-            "found": found,
-            "length": length,
-            "count": count,
-            "status_msg": status_msg,
-            "actual_found": 0,
-            "last_found_time": time.time()
-        }
+            status_msg = await update.message.reply_text(
+                f"🔍 Поиск paste.pics начат\n"
+                f"Цель: {count} изображений\n"
+                f"Найдено: 0/{count}\n"
+                f"Проверено: 0\n"
+                f"Время: 0с"
+            )
+            
+            self.sessions[key] = {
+                "task": None,
+                "stop": False,
+                "start_time": time.time(),
+                "last_update": time.time(),
+                "last_found_time": time.time(),
+                "status_msg": status_msg,
+                "target_count": count,
+                "found": 0,
+                "analyzed": 0,
+                "source_type": "pastenow"
+            }
+            
+            self.command_cooldowns[key] = time.time()
+
+        await self.show_main_menu(update)
+        
+        asyncio.create_task(self._search_pastenow(update, key, count))
+
+    async def _search_pastenow(self, update: Update, key: Tuple[int, int], count: int):
+        try:
+            async with self.lock:
+                session = self.sessions[key]
+                session["task"] = asyncio.current_task()
+                self.sessions[key] = session
+            
+            last_update_time = time.time()
+            
+            while not session.get("stop", False) and session["found"] < count:
+                if self.is_locked_by_flood("pastenow"):
+                    wait_sec = int(self.flood_lock["pastenow"] - time.time())
+                    if wait_sec > 0:
+                        await asyncio.sleep(wait_sec)
+                    continue
+                
+                if self.is_source_disabled("pastenow"):
+                    logger.info("Источник paste.pics временно отключен")
+                    async with self.lock:
+                        session["stop"] = True
+                        session["stop_reason"] = "source_disabled"
+                    break
+                
+                code = self.generate_random_string(5)
+                
+                try:
+                    url = await self.extract_pastenow_image_url(code)
+                    if not url:
+                        continue
+                        
+                    _, ext = await self.check_image(url, "pastenow")
+                    
+                    async with self.lock:
+                        session["analyzed"] += 1
+                        analyzed = session["analyzed"]
+                        self.sessions[key] = session
+                    
+                    if analyzed % UPDATE_ON_CHECKED == 0:
+                        await self.update_status_message(key, force=True)
+                    
+                    current_time = time.time()
+                    if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
+                        await self.update_status_message(key)
+                        last_update_time = current_time
+                    
+                    if ext:
+                        async with self.lock:
+                            session["found"] += 1
+                            session["last_found_time"] = time.time()
+                            found = session["found"]
+                            self.sessions[key] = session
+                            
+                        await self.add_to_media_group(
+                            update, key, url, ext, count, found, "pastenow"
+                        )
+                        
+                        if found % UPDATE_ON_FOUND == 0:
+                            await self.update_status_message(key, force=True)
+                    
+                    await asyncio.sleep(0.5)
+                    
+                except FloodControlException as fce:
+                    await self.handle_flood_control(update, fce.retry_in, "pastenow")
+                except Exception as e:
+                    logger.error(f"Ошибка при проверке изображения paste.pics: {str(e)}")
+                    async with self.lock:
+                        session["stop"] = True
+                        session["stop_reason"] = "source_disabled"
+                    break
+            
+        except asyncio.CancelledError:
+            logger.info(f"Поиск paste.pics для пользователя {key} отменен")
+        except Exception as e:
+            logger.error(f"Ошибка при поиске paste.pics: {str(e)}")
+        finally:
+            if key in self.media_groups and self.media_groups[key]:
+                media_to_send = self.media_groups[key]
+                self.media_groups[key] = []
+                await self.send_media_group(update, media_to_send, key)
+            
+            async with self.lock:
+                if key in self.sessions:
+                    session = self.sessions[key]
+                    elapsed = int(time.time() - session["start_time"])
+                    target = session["target_count"]
+                    found = session.get("found", 0)
+                    analyzed = session.get("analyzed", 0)
+                    stop_reason = session.get("stop_reason", "")
+                    
+                    if session.get("stop", False) and found < target:
+                        text = f"🔴 Поиск остановлен\n"
+                        if stop_reason == "source_disabled":
+                            text += "⚠️ Источник временно недоступен\n"
+                        text += (
+                            f"Цель: {target} изображений\n"
+                            f"Найдено: {found}/{target}\n"
+                            f"Проверено: {analyzed}\n"
+                            f"Время: {format_time(elapsed)}"
+                        )
+                    else:
+                        text = (
+                            f"✅ Поиск завершен\n"
+                            f"Цель: {target} изображений\n"
+                            f"Найдено: {found}/{target}\n"
+                            f"Проверено: {analyzed}\n"
+                            f"Время: {format_time(elapsed)}"
+                        )
+                    
+                    await self.safe_reply_text(update, text)
+                    
+                    self.cleanup_user_session(key)
+                    await self.show_main_menu(update)
 
     async def get_freeimage_images(self, update: Update, context: CallbackContext):
-        user_id = update.effective_user.id
+        key = self.get_key(update)
         
-        if await self.check_cooldown(update, user_id):
+        if await self.check_cooldown(update):
             return
-        
+            
         args = context.args
         if len(args) != 1:
-            await update.message.reply_text("Используйте: /getfreeimage <1-50>")
+            await self.safe_reply_text(update, "Используйте: /getfreeimage <1-50>")
             return
+
         try:
             count = int(args[0])
         except ValueError:
-            await update.message.reply_text("Количество должно быть числом")
+            await self.safe_reply_text(update, "Количество должно быть числом")
             return
 
         if not 1 <= count <= 50:
-            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
+            await self.safe_reply_text(update, "Можно запросить от 1 до 50 изображений за раз")
             return
 
-        if self.is_locked_by_flood("freeimage"):
-            wait_sec = int(self.flood_lock["freeimage"] - time.time())
-            await update.message.reply_text(
-                f"🔒 Поиск временно заблокирован из-за flood control!\n"
-                f"Осталось ждать: {format_time_full(wait_sec)}."
-            )
-            return
-
-        last_command = self.last_commands.get(user_id)
-        active_session = self.sessions.get(user_id)
-        if (
-            active_session and not active_session.get("stop", True)
-            and last_command
-            and last_command["type"] == "freeimage"
-            and last_command["count"] == count
-        ):
-            await update.message.reply_text("❗️Идентичный поиск уже выполняется.")
-            return
-
-        if active_session and active_session.get("task"):
-            active_session["stop"] = True
-            old_task = active_session["task"]
-            try:
-                old_task.cancel()
-                await old_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Ошибка при завершении предыдущего поиска: {str(e)}")
-            self.cleanup_user_session(user_id)
-
-        self.last_commands[user_id] = {
-            "type": "freeimage",
-            "length": 7,
-            "count": count,
-            "timestamp": time.time()
-        }
-
-        length = 7
-        start_time = time.time()
-        analyzed = 0
-        found = 0
-        last_found_time = time.time()
-        last_status_update = 0
-
-        logger.info(f"Freeimage поиск пользователя {user_id} начат. Количество: {count}")
-
-        status_msg = await update.message.reply_text(
-            f"🔍 Поиск freeimage начат\n"
-            f"Длина: {length}\n"
-            f"Цель: {count} изображений\n"
-            f"Найдено: 0/{count}\n"
-            f"Проверено: 0\n"
-            f"Время: 0с"
-        )
-        
-        self.command_cooldowns[user_id] = time.time()
-
-        async def update_status(force=False):
-            nonlocal last_status_update
-            current_time = time.time()
-            if force or current_time - last_status_update >= 10:
-                elapsed = int(current_time - start_time)
-                await status_msg.edit_text(
-                    f"🔍 Поиск freeimage\n"
-                    f"Длина: {length}\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено: {found}/{count}\n"
-                    f"Проверено: {analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                last_status_update = current_time
-
-        async def search_loop():
-            nonlocal analyzed, found, last_found_time
-            timeout_task = None
-            try:
-                session = self.sessions.get(user_id)
-                if not session:
+        async with self.lock:
+            if key in self.sessions:
+                current_session = self.sessions[key]
+                if current_session["source_type"] == "freeimage" and current_session["target_count"] == count:
+                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
                     return
-                session["actual_found"] = 0
-                session["_real_sent_ids"] = set()
-                session["last_found_time"] = time.time()
-                timeout_task = asyncio.create_task(self.check_and_send_timeout(update, user_id))
-                last_status_update = 0
-                last_progress_analyzed = 0
-                while session.get("actual_found", 0) < count and not session.get("stop", False):
-                    if self.is_locked_by_flood("freeimage"):
-                        wait_sec = int(self.flood_lock["freeimage"] - time.time())
-                        await update.message.reply_text(
-                            f"🔒 Поиск временно заблокирован из-за flood control!\n"
-                            f"Осталось ждать: {format_time_full(wait_sec)}."
-                        )
-                        await asyncio.sleep(wait_sec)
-                        continue
-                    tasks = []
-                    for _ in range(10):
-                        code = self.generate_random_string(length)
-                        url = f"https://iili.io/{code}.jpg"
-                        tasks.append(self.check_image_async(url, "freeimage"))
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for result in results:
-                        session = self.sessions.get(user_id)
-                        if not session or session.get("stop", False):
-                            break
-                        if session.get("stop", False) or session.get("actual_found", 0) >= count:
-                            break
-                        if isinstance(result, FloodControlException):
-                            await self.handle_flood_control(update, result.retry_in, "freeimage")
-                            break
-                        if isinstance(result, Exception):
-                            msg = str(result)
-                            if "timeout" in msg.lower() or "time out" in msg.lower():
-                                await update.message.reply_text("❗️Ошибка таймаута на freeimage, жду 60 секунд, продолжаю поиск.")
-                                await asyncio.sleep(60)
-                                continue
-                            if "Flood control exceeded" in msg and "Retry in " in msg:
-                                try:
-                                    retry_in = int(msg.split("Retry in ")[1].split(" ")[0])
-                                    await self.handle_flood_control(update, retry_in, "freeimage")
-                                    break
-                                except Exception:
-                                    pass
-                            logger.error(f"Ошибка в check_image_async (freeimage): {result}")
-                            continue
-                        url, ext = result
-                        analyzed += 1
-                        session["analyzed"] = analyzed
-                        if ext:
-                            found += 1
-                            last_found_time = time.time()
-                            session["found"] = found
-                            session["last_found_time"] = last_found_time
-                            await self.add_to_media_group(
-                                update, user_id, url, ext, count, found, "freeimage"
-                            )
-                        if analyzed - last_progress_analyzed >= 5:
-                            await update_status()
-                            last_progress_analyzed = analyzed
-                    await update_status()
+                else:
+                    await self.stop(update, context, silent=True)
                     await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                logger.info(f"Поиск freeimage для пользователя {user_id} отменён")
-            except Exception as e:
-                logger.error(f"Ошибка в поиске freeimage для пользователя {user_id}: {str(e)}")
-                await asyncio.sleep(10)
-            finally:
-                if timeout_task:
-                    timeout_task.cancel()
-                    try:
-                        await timeout_task
-                    except:
-                        pass
-                session = self.sessions.get(user_id, {})
-                actual_found = session.get("actual_found", 0)
-                if user_id in self.media_groups and self.media_groups[user_id]:
-                    new_media = []
-                    for media in self.media_groups[user_id]:
-                        image_id = self.extract_image_id(media.caption)
-                        if not image_id or image_id not in self.sent_image_ids.get(user_id, set()):
-                            new_media.append(media)
-                    if new_media:
-                        logger.info(f"Финальная отправка {len(new_media)} изображений пользователю {user_id}")
-                        await self.send_media_group(update, new_media, user_id)
-                elapsed = int(time.time() - start_time)
-                logger.info(
-                    f"Freeimage поиск пользователя {user_id} завершён. "
-                    f"Количество: {count}, найдено: {actual_found}, проверено: {analyzed}, время: {self.format_time(elapsed)}"
-                )
-                await update.message.reply_text(
-                    f"✅ Поиск freeimage завершён\n"
-                    f"Длина: {length}\n"
-                    f"Цель: {count} изображений\n"
-                    f"Найдено уникальных: {actual_found}/{count}\n"
-                    f"Проверено: {analyzed}\n"
-                    f"Время: {self.format_time(elapsed)}"
-                )
-                self.cleanup_user_session(user_id)
+                    
+            self.last_commands[key] = {
+                "type": "freeimage",
+                "count": count,
+                "timestamp": time.time()
+            }
 
-        task = asyncio.create_task(search_loop())
-        self.sessions[user_id] = {
-            "task": task,
-            "stop": False,
-            "start_time": start_time,
-            "analyzed": analyzed,
-            "found": found,
-            "length": length,
-            "count": count,
-            "status_msg": status_msg,
-            "actual_found": 0,
-            "last_found_time": time.time()
-        }
+            status_msg = await update.message.reply_text(
+                f"🔍 Поиск freeimage начат\n"
+                f"Цель: {count} изображений\n"
+                f"Найдено: 0/{count}\n"
+                f"Проверено: 0\n"
+                f"Время: 0с"
+            )
+            
+            self.sessions[key] = {
+                "task": None,
+                "stop": False,
+                "start_time": time.time(),
+                "last_update": time.time(),
+                "last_found_time": time.time(),
+                "status_msg": status_msg,
+                "target_count": count,
+                "found": 0,
+                "analyzed": 0,
+                "source_type": "freeimage"
+            }
+            
+            self.command_cooldowns[key] = time.time()
+
+        await self.show_main_menu(update)
+        
+        asyncio.create_task(self._search_freeimage(update, key, count))
+
+    async def _search_freeimage(self, update: Update, key: Tuple[int, int], count: int):
+        try:
+            async with self.lock:
+                session = self.sessions[key]
+                session["task"] = asyncio.current_task()
+                self.sessions[key] = session
+            
+            last_update_time = time.time()
+            
+            while not session.get("stop", False) and session["found"] < count:
+                if self.is_locked_by_flood("freeimage"):
+                    wait_sec = int(self.flood_lock["freeimage"] - time.time())
+                    if wait_sec > 0:
+                        await asyncio.sleep(wait_sec)
+                    continue
+                
+                if self.is_source_disabled("freeimage"):
+                    logger.info("Источник freeimage временно отключен")
+                    async with self.lock:
+                        session["stop"] = True
+                        session["stop_reason"] = "source_disabled"
+                    break
+                
+                code = self.generate_random_string(7)
+                url = f"https://iili.io/{code}.jpg"
+                
+                try:
+                    _, ext = await self.check_image(url, "freeimage")
+                    
+                    async with self.lock:
+                        session["analyzed"] += 1
+                        analyzed = session["analyzed"]
+                        self.sessions[key] = session
+                    
+                    if analyzed % UPDATE_ON_CHECKED == 0:
+                        await self.update_status_message(key, force=True)
+                    
+                    current_time = time.time()
+                    if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
+                        await self.update_status_message(key)
+                        last_update_time = current_time
+                    
+                    if ext:
+                        async with self.lock:
+                            session["found"] += 1
+                            session["last_found_time"] = time.time()
+                            found = session["found"]
+                            self.sessions[key] = session
+                            
+                        await self.add_to_media_group(
+                            update, key, url, ext, count, found, "freeimage"
+                        )
+                        
+                        if found % UPDATE_ON_FOUND == 0:
+                            await self.update_status_message(key, force=True)
+                    
+                    await asyncio.sleep(0.5)
+                    
+                except FloodControlException as fce:
+                    await self.handle_flood_control(update, fce.retry_in, "freeimage")
+                except Exception as e:
+                    logger.error(f"Ошибка при проверке изображения freeimage: {str(e)}")
+                    async with self.lock:
+                        session["stop"] = True
+                        session["stop_reason"] = "source_disabled"
+                    break
+            
+        except asyncio.CancelledError:
+            logger.info(f"Поиск freeimage для пользователя {key} отменен")
+        except Exception as e:
+            logger.error(f"Ошибка при поиске freeimage: {str(e)}")
+        finally:
+            if key in self.media_groups and self.media_groups[key]:
+                media_to_send = self.media_groups[key]
+                self.media_groups[key] = []
+                await self.send_media_group(update, media_to_send, key)
+            
+            async with self.lock:
+                if key in self.sessions:
+                    session = self.sessions[key]
+                    elapsed = int(time.time() - session["start_time"])
+                    target = session["target_count"]
+                    found = session.get("found", 0)
+                    analyzed = session.get("analyzed", 0)
+                    stop_reason = session.get("stop_reason", "")
+                    
+                    if session.get("stop", False) and found < target:
+                        text = f"🔴 Поиск остановлен\n"
+                        if stop_reason == "source_disabled":
+                            text += "⚠️ Источник временно недоступен\n"
+                        text += (
+                            f"Цель: {target} изображений\n"
+                            f"Найдено: {found}/{target}\n"
+                            f"Проверено: {analyzed}\n"
+                            f"Время: {format_time(elapsed)}"
+                        )
+                    else:
+                        text = (
+                            f"✅ Поиск завершен\n"
+                            f"Цель: {target} изображений\n"
+                            f"Найдено: {found}/{target}\n"
+                            f"Проверено: {analyzed}\n"
+                            f"Время: {format_time(elapsed)}"
+                        )
+                    
+                    await self.safe_reply_text(update, text)
+                    
+                    self.cleanup_user_session(key)
+                    await self.show_main_menu(update)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
-        user_id = update.effective_user.id
+        key = self.get_key(update)
 
-        if text not in ["СТОП", "НАЗАД"] and await self.check_cooldown(update, user_id):
+        if text not in ["СТОП", "НАЗАД"] and await self.check_cooldown(update):
             return
 
         if text == "PRNT.SC":
@@ -1861,7 +1600,7 @@ class ImageBot:
         elif text == "IMGUR":
             reply_keyboard = [["5", "7"], ["НАЗАД"]]
             await update.message.reply_text(
-                "IMGUR - Выберите интервал:",
+                "IMGUR - Выберите длину ссылки:",
                 reply_markup=ReplyKeyboardMarkup(
                     reply_keyboard, resize_keyboard=True, is_persistent=True
                 ),
@@ -1918,7 +1657,7 @@ class ImageBot:
                 ["50", "НАЗАД"],
             ]
             await update.message.reply_text(
-                f"IMGUR - Выбран интервал {text}. Теперь выберите количество:",
+                f"IMGUR - Выбрана длина {text}. Теперь выберите количество:",
                 reply_markup=ReplyKeyboardMarkup(
                     reply_keyboard, resize_keyboard=True, is_persistent=True
                 ),
@@ -1943,7 +1682,6 @@ class ImageBot:
                 context.args = [text]
                 await self.get_prnt_images(update, context)
 
-            await self.show_main_menu(update)
             context.user_data.clear()
 
         elif text == "НАЗАД":
@@ -1952,7 +1690,6 @@ class ImageBot:
 
         elif text == "СТОП":
             await self.stop(update, context)
-            await self.show_main_menu(update)
 
         elif text == "ПОВТОРИТЬ":
             await self.repeat_last_command(update, context)
