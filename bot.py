@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import RetryAfter, BadRequest, Forbidden
+from telegram.error import RetryAfter, BadRequest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 
@@ -86,23 +86,6 @@ def format_time(seconds: int) -> str:
     else:
         return f"{seconds}с"
 
-def add_flood_control_reserve(retry_in: int) -> int:
-    if retry_in >= 3600:
-        return retry_in + 3600
-    elif retry_in >= 600:
-        return retry_in + 600
-    elif retry_in >= 240:
-        return retry_in + 240
-    elif retry_in >= 60:
-        return retry_in + 60
-    else:
-        return retry_in + 20
-
-class FloodControlException(Exception):
-    def __init__(self, retry_in: int):
-        self.retry_in = retry_in
-        super().__init__(f"Flood control exceeded. Retry in {retry_in} seconds")
-
 class ImageBot:
     def __init__(self):
         self.valid_extensions = [".jpg", ".jpeg", ".png", ".gif"]
@@ -114,49 +97,40 @@ class ImageBot:
         # Ключ: кортеж (chat_id, user_id) - идентификатор чата и пользователя
         # Значение: словарь с данными текущей сессии поиска
         self.sessions: Dict[Tuple[int, int], Dict] = {}
-        
         # Словарь последних выполненных команд пользователей.
         # Ключ: кортеж (chat_id, user_id)
         # Значение: словарь с параметрами последней команды (тип, количество и т.д.)
         self.last_commands: Dict[Tuple[int, int], Dict] = {}
-        
         # Группы медиа для отправки пользователям.
         # Ключ: кортеж (chat_id, user_id)
         # Значение: список InputMediaPhoto/InputMediaAnimation для групповой отправки
         self.media_groups: Dict[Tuple[int, int], List] = {}
-        
         # Уникальные идентификаторы уже отправленных изображений.
         # Ключ: кортеж (chat_id, user_id)
         # Значение: множество строковых ID изображений (для предотвращения дубликатов)
         self.sent_image_ids: Dict[Tuple[int, int], Set[str]] = {}
-        
         # Блокировка источников при флуд-контроле.
         # Ключ: название источника ('imgur', 'prnt' и т.д.)
         # Значение: временная метка (timestamp) до которой источник заблокирован
         self.flood_lock: Dict[str, float] = {}
-        
         # Временные метки последних команд пользователей.
         # Ключ: user_id
         # Значение: временная метка последней команды (для кулдауна)
         self.command_cooldowns: Dict[Tuple[int, int], float] = {}
         # Длительность кулдауна между командами (в секундах).
         # Пользователь не может отправлять команды чаще, чем раз в это время
-        self.cooldown_duration: int = 180  # 3 минуты
-        
+        self.cooldown_duration: int = 180
         # Исполнитель для запуска синхронных задач в отдельных потоках.
         # Позволяет выполнять блокирующие операции (например, HTTP-запросы)
         # без блокировки основного event loop'а
-        self.executor = ThreadPoolExecutor(max_workers=20)  # Макс. 20 параллельных потоков
-        
+        self.executor = ThreadPoolExecutor(max_workers=20)
         # Блокировка для синхронизации доступа к общим ресурсам
         # при работе с асинхронным кодом (защита от race conditions)
         self.lock = asyncio.Lock()
-        
         # Временные ошибки источников.
         # Ключ: название источника ('imgur', 'prnt' и т.д.)
         # Значение: временная метка последней ошибки (для временного отключения источника)
         self.source_errors: Dict[str, float] = {}
-        
         # Количество попыток повтора при неудачной отправке медиагруппы
         self.retry_attempts: int = 3
 
@@ -183,31 +157,9 @@ class ImageBot:
         if remaining > 0:
             await update.message.reply_text(
                 f"⚠️ Пожалуйста, подождите {format_time(int(remaining))} "
-                "перед отправкой следующей команды, чтобы избежать блокировки бота."
+                "перед отправкой следующей команды."
             )
             return True
-        return False
-
-    async def safe_reply_text(self, update: Update, text: str, max_retries: int = 3) -> bool:
-        key = self.get_key(update)
-        retries = 0
-        while retries < max_retries:
-            try:
-                await update.message.reply_text(text)
-                return True
-            except RetryAfter as e:
-                wait = e.retry_after
-                logger.warning(f"Flood control при отправке текста для {key}. Ожидание {wait} секунд")
-                await asyncio.sleep(wait)
-                retries += 1
-            except Forbidden as e:
-                logger.error(f"Бот заблокирован пользователем {key}: {str(e)}")
-                return False
-            except Exception as e:
-                logger.error(f"Ошибка при отправке текста для {key}: {str(e)}")
-                retries += 1
-                await asyncio.sleep(1)
-        logger.error(f"Не удалось отправить сообщение для {key} после {max_retries} попыток")
         return False
 
     def generate_random_string(self, length: int) -> str:
@@ -366,9 +318,6 @@ class ImageBot:
                     except Exception as e:
                         logger.error(f"Ошибка при отправке отдельного медиа: {str(e)}")
                 return True
-            except Forbidden as e:
-                logger.error(f"Бот заблокирован пользователем {key}: {str(e)}")
-                return False
             except Exception as e:
                 logger.error(f"Ошибка при отправке группы медиа: {str(e)}")
                 attempts += 1
@@ -383,8 +332,6 @@ class ImageBot:
                 await update.message.reply_animation(animation=url, caption=caption, parse_mode="Markdown")
             else:
                 await update.message.reply_photo(photo=url, caption=caption, parse_mode="Markdown")
-        except Forbidden as e:
-            logger.error(f"Бот заблокирован пользователем {key}: {str(e)}")
         except Exception as e:
             logger.error(f"Ошибка при отправке одиночного медиа: {str(e)}")
 
@@ -494,7 +441,7 @@ class ImageBot:
         async with self.lock:
             if key not in self.sessions:
                 if not silent:
-                    await self.safe_reply_text(update, "❗️ Нет активного поиска.")
+                    await update.message.reply_text("❗️ Нет активного поиска.")
                 return
     
             session = self.sessions[key]
@@ -522,7 +469,7 @@ class ImageBot:
                     f"Время: {format_time(elapsed)}"
                 )
                 
-                await self.safe_reply_text(update, message)
+                await update.message.reply_text(message)
             
             self.cleanup_user_session(key)
             if not silent:
@@ -550,7 +497,7 @@ class ImageBot:
         key = self.get_key(update)
         last_command = self.last_commands.get(key)
         if not last_command:
-            await self.safe_reply_text(update, "❗️ Нет предыдущей команды для повторения.")
+            await update.message.reply_text("❗️ Нет предыдущей команды для повторения.")
             return
             
         async with self.lock:
@@ -559,7 +506,7 @@ class ImageBot:
                 if (current_session["source_type"] == last_command["type"] and 
                     current_session.get("length", 0) == last_command.get("length", 0) and 
                     current_session["target_count"] == last_command["count"]):
-                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
+                    await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
                     return
                 else:
                     await self.stop(update, context, silent=True)
@@ -587,11 +534,6 @@ class ImageBot:
                 return
                 
             session = self.sessions[key]
-            
-            # Проверка блокировки обновлений из-за флуд-контроля
-            if not force and session.get('status_update_blocked_until', 0) > time.time():
-                return
-                
             current_time = time.time()
             session["last_update"] = current_time
             self.sessions[key] = session
@@ -622,27 +564,9 @@ class ImageBot:
                 )
                 
                 await status_msg.edit_text(text)
-            except RetryAfter as e:
-                logger.warning(f"Flood control при обновлении статуса для {key}. Ожидание {e.retry_after} секунд")
-                async with self.lock:
-                    if key in self.sessions:
-                        self.sessions[key]['status_update_blocked_until'] = time.time() + e.retry_after
             except Exception as e:
                 logger.error(f"Ошибка при обновлении статуса для {key}: {str(e)}")
 
-    async def handle_flood_control(self, update, retry_in, scope="imgur"):
-        now = time.time()
-        retry_with_reserve = add_flood_control_reserve(retry_in)
-        self.flood_lock[scope] = now + retry_with_reserve
-        formatted_time = format_time(retry_with_reserve)
-        logger.warning(f"Flood control: ожидание {retry_with_reserve} секунд")
-        await self.safe_reply_text(update, f"⚠️ Flood control! Поиск приостановлен примерно на {formatted_time}.")
-        await asyncio.sleep(retry_with_reserve)
-
-    def is_locked_by_flood(self, scope="imgur"):
-        now = time.time()
-        return (scope in self.flood_lock) and (self.flood_lock[scope] > now)
-    
     def is_source_disabled(self, source: str) -> bool:
         if source in self.source_errors:
             return (time.time() - self.source_errors[source]) < SOURCE_TIMEOUT
@@ -656,24 +580,24 @@ class ImageBot:
             
         args = context.args
         if len(args) != 1:
-            await self.safe_reply_text(update, "Используйте: /getall <1-50>")
+            await update.message.reply_text("Используйте: /getall <1-50>")
             return
 
         try:
             count = int(args[0])
         except ValueError:
-            await self.safe_reply_text(update, "Количество должно быть числом")
+            await update.message.reply_text("Количество должно быть числом")
             return
 
         if not 1 <= count <= 50:
-            await self.safe_reply_text(update, "Можно запросить от 1 до 50 изображений за раз")
+            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
         async with self.lock:
             if key in self.sessions:
                 current_session = self.sessions[key]
                 if current_session["source_type"] == "all" and current_session["target_count"] == count:
-                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
+                    await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
                     return
                 else:
                     await self.stop(update, context, silent=True)
@@ -737,12 +661,6 @@ class ImageBot:
                 if session["sources"][source_type]["found"] >= max_per_source:
                     break
                     
-                if self.is_locked_by_flood(source_type):
-                    wait_sec = int(self.flood_lock[source_type] - time.time())
-                    if wait_sec > 0:
-                        await asyncio.sleep(wait_sec)
-                    continue
-                
                 if self.is_source_disabled(source_type):
                     logger.info(f"Источник {source_type} временно отключен")
                     async with self.lock:
@@ -822,8 +740,6 @@ class ImageBot:
                     
                     await asyncio.sleep(0.5)
                     
-                except FloodControlException as fce:
-                    await self.handle_flood_control(update, fce.retry_in, source_type)
                 except Exception as e:
                     logger.error(f"Ошибка при поиске в {source_type}: {str(e)}")
                     async with self.lock:
@@ -884,7 +800,7 @@ class ImageBot:
                         f"Время: {format_time(elapsed)}"
                     )
                     
-                    await self.safe_reply_text(update, message)
+                    await update.message.reply_text(message)
                     
                     self.cleanup_user_session(key)
                     await self.show_main_menu(update)
@@ -897,29 +813,29 @@ class ImageBot:
             
         args = context.args
         if len(args) != 2:
-            await self.safe_reply_text(update, "Используйте: /getimg <5|7> <1-50>")
+            await update.message.reply_text("Используйте: /getimg <5|7> <1-50>")
             return
 
         try:
             length = int(args[0])
             count = int(args[1])
         except ValueError:
-            await self.safe_reply_text(update, "Длина и количество должны быть числами")
+            await update.message.reply_text("Длина и количество должны быть числами")
             return
 
         if length not in [5, 7]:
-            await self.safe_reply_text(update, "Длина может быть только 5 или 7 символов")
+            await update.message.reply_text("Длина может быть только 5 или 7 символов")
             return
 
         if not 1 <= count <= 50:
-            await self.safe_reply_text(update, "Можно запросить от 1 до 50 изображений за раз")
+            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
         async with self.lock:
             if key in self.sessions:
                 current_session = self.sessions[key]
                 if current_session["source_type"] == "imgur" and current_session.get("length", 0) == length and current_session["target_count"] == count:
-                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
+                    await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
                     return
                 else:
                     await self.stop(update, context, silent=True)
@@ -971,12 +887,6 @@ class ImageBot:
             last_update_time = time.time()
             
             while not session.get("stop", False) and session["found"] < count:
-                if self.is_locked_by_flood("imgur"):
-                    wait_sec = int(self.flood_lock["imgur"] - time.time())
-                    if wait_sec > 0:
-                        await asyncio.sleep(wait_sec)
-                    continue
-                
                 code = self.generate_random_string(length)
                 url = f"https://i.imgur.com/{code}.jpg"
                 
@@ -1015,8 +925,6 @@ class ImageBot:
                     
                     await asyncio.sleep(0.5)
                     
-                except FloodControlException as fce:
-                    await self.handle_flood_control(update, fce.retry_in, "imgur")
                 except Exception as e:
                     logger.error(f"Ошибка при проверке изображения Imgur: {str(e)}")
             
@@ -1047,7 +955,7 @@ class ImageBot:
                         f"Время: {format_time(elapsed)}"
                     )
                     
-                    await self.safe_reply_text(update, message)
+                    await update.message.reply_text(message)
                     
                     self.cleanup_user_session(key)
                     await self.show_main_menu(update)
@@ -1060,24 +968,24 @@ class ImageBot:
             
         args = context.args
         if len(args) != 1:
-            await self.safe_reply_text(update, "Используйте: /getprnt <1-50>")
+            await update.message.reply_text("Используйте: /getprnt <1-50>")
             return
 
         try:
             count = int(args[0])
         except ValueError:
-            await self.safe_reply_text(update, "Количество должно быть числом")
+            await update.message.reply_text("Количество должно быть числом")
             return
 
         if not 1 <= count <= 50:
-            await self.safe_reply_text(update, "Можно запросить от 1 до 50 изображений за раз")
+            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
         async with self.lock:
             if key in self.sessions:
                 current_session = self.sessions[key]
                 if current_session["source_type"] == "prnt" and current_session["target_count"] == count:
-                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
+                    await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
                     return
                 else:
                     await self.stop(update, context, silent=True)
@@ -1126,12 +1034,6 @@ class ImageBot:
             last_update_time = time.time()
             
             while not session.get("stop", False) and session["found"] < count:
-                if self.is_locked_by_flood("prnt"):
-                    wait_sec = int(self.flood_lock["prnt"] - time.time())
-                    if wait_sec > 0:
-                        await asyncio.sleep(wait_sec)
-                    continue
-                
                 if self.is_source_disabled("prnt"):
                     logger.info("Источник prnt.sc временно отключен")
                     async with self.lock:
@@ -1177,8 +1079,6 @@ class ImageBot:
                     
                     await asyncio.sleep(0.5)
                     
-                except FloodControlException as fce:
-                    await self.handle_flood_control(update, fce.retry_in, "prnt")
                 except Exception as e:
                     logger.error(f"Ошибка при проверке изображения prnt.sc: {str(e)}")
                     async with self.lock:
@@ -1224,7 +1124,7 @@ class ImageBot:
                             f"Время: {format_time(elapsed)}"
                         )
                     
-                    await self.safe_reply_text(update, text)
+                    await update.message.reply_text(text)
                     
                     self.cleanup_user_session(key)
                     await self.show_main_menu(update)
@@ -1237,24 +1137,24 @@ class ImageBot:
             
         args = context.args
         if len(args) != 1:
-            await self.safe_reply_text(update, "Используйте: /getpastenow <1-50>")
+            await update.message.reply_text("Используйте: /getpastenow <1-50>")
             return
 
         try:
             count = int(args[0])
         except ValueError:
-            await self.safe_reply_text(update, "Количество должно быть числом")
+            await update.message.reply_text("Количество должно быть числом")
             return
 
         if not 1 <= count <= 50:
-            await self.safe_reply_text(update, "Можно запросить от 1 до 50 изображений за раз")
+            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
         async with self.lock:
             if key in self.sessions:
                 current_session = self.sessions[key]
                 if current_session["source_type"] == "pastenow" and current_session["target_count"] == count:
-                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
+                    await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
                     return
                 else:
                     await self.stop(update, context, silent=True)
@@ -1303,12 +1203,6 @@ class ImageBot:
             last_update_time = time.time()
             
             while not session.get("stop", False) and session["found"] < count:
-                if self.is_locked_by_flood("pastenow"):
-                    wait_sec = int(self.flood_lock["pastenow"] - time.time())
-                    if wait_sec > 0:
-                        await asyncio.sleep(wait_sec)
-                    continue
-                
                 if self.is_source_disabled("pastenow"):
                     logger.info("Источник paste.pics временно отключен")
                     async with self.lock:
@@ -1354,8 +1248,6 @@ class ImageBot:
                     
                     await asyncio.sleep(0.5)
                     
-                except FloodControlException as fce:
-                    await self.handle_flood_control(update, fce.retry_in, "pastenow")
                 except Exception as e:
                     logger.error(f"Ошибка при проверке изображения paste.pics: {str(e)}")
                     async with self.lock:
@@ -1401,7 +1293,7 @@ class ImageBot:
                             f"Время: {format_time(elapsed)}"
                         )
                     
-                    await self.safe_reply_text(update, text)
+                    await update.message.reply_text(text)
                     
                     self.cleanup_user_session(key)
                     await self.show_main_menu(update)
@@ -1414,24 +1306,24 @@ class ImageBot:
             
         args = context.args
         if len(args) != 1:
-            await self.safe_reply_text(update, "Используйте: /getfreeimage <1-50>")
+            await update.message.reply_text("Используйте: /getfreeimage <1-50>")
             return
 
         try:
             count = int(args[0])
         except ValueError:
-            await self.safe_reply_text(update, "Количество должно быть числом")
+            await update.message.reply_text("Количество должно быть числом")
             return
 
         if not 1 <= count <= 50:
-            await self.safe_reply_text(update, "Можно запросить от 1 до 50 изображений за раз")
+            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
         async with self.lock:
             if key in self.sessions:
                 current_session = self.sessions[key]
                 if current_session["source_type"] == "freeimage" and current_session["target_count"] == count:
-                    await self.safe_reply_text(update, "❗️ Идентичный поиск уже выполняется.")
+                    await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
                     return
                 else:
                     await self.stop(update, context, silent=True)
@@ -1480,12 +1372,6 @@ class ImageBot:
             last_update_time = time.time()
             
             while not session.get("stop", False) and session["found"] < count:
-                if self.is_locked_by_flood("freeimage"):
-                    wait_sec = int(self.flood_lock["freeimage"] - time.time())
-                    if wait_sec > 0:
-                        await asyncio.sleep(wait_sec)
-                    continue
-                
                 if self.is_source_disabled("freeimage"):
                     logger.info("Источник freeimage временно отключен")
                     async with self.lock:
@@ -1528,8 +1414,6 @@ class ImageBot:
                     
                     await asyncio.sleep(0.5)
                     
-                except FloodControlException as fce:
-                    await self.handle_flood_control(update, fce.retry_in, "freeimage")
                 except Exception as e:
                     logger.error(f"Ошибка при проверке изображения freeimage: {str(e)}")
                     async with self.lock:
@@ -1575,7 +1459,7 @@ class ImageBot:
                             f"Время: {format_time(elapsed)}"
                         )
                     
-                    await self.safe_reply_text(update, text)
+                    await update.message.reply_text(text)
                     
                     self.cleanup_user_session(key)
                     await self.show_main_menu(update)
