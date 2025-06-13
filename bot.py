@@ -470,18 +470,22 @@ class ImageBot:
         await self.show_main_menu(update)
         await update.message.reply_text(
             """
-Привет! Я бот для поиска случайных изображений.
+Привет! Я бот для поиска случайных изображений с различных сервисов.
 
-Команды:
-  /getimg <5|7> <1-50> — поиск на Imgur
-  /getprnt <1-50> — поиск на prnt.sc
-  /getpastenow <1-50> — поиск на paste.pics
-  /getfreeimage <1-50> — поиск на freeimage
-  /getall <1-50> — поиск по всем источникам
-  /stop — остановить текущий поиск
-  /repeat — повторить последний поиск
+Я создан @memory_not_found и могу искать изображения на:
+- Imgur (5 и 7 символов)
+- Prnt.sc
+- Paste.pics
+- FreeImage
 
-Или используйте кнопки ниже:
+Используйте кнопки ниже для начала поиска или команды:
+/getimg <5|7> <1-50> - поиск на Imgur
+/getprnt <1-50> - поиск на prnt.sc
+/getpastenow <1-50> - поиск на paste.pics
+/getfreeimage <1-50> - поиск на freeimage
+/getall <1-50> - поиск на всех источниках
+/stop - остановить текущий поиск
+/repeat - повторить последний поиск
 """
         )
 
