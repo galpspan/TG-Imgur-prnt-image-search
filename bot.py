@@ -4,8 +4,7 @@ import string
 import time
 import asyncio
 import aiohttp
-import re
-from typing import List, Dict, Set, Tuple, Optional, Union
+from typing import List, Dict, Set, Tuple, Optional
 from telegram import Update, ReplyKeyboardMarkup, InputMediaPhoto, InputMediaAnimation
 from telegram.ext import (
     Application,
@@ -15,28 +14,33 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import RetryAfter, BadRequest, TelegramError
+from telegram.error import RetryAfter, BadRequest
 from bs4 import BeautifulSoup
 import signal
 
-# Настройка логирования
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# ======================= НАСТРОЙКИ ЛОГИРОВАНИЯ =======================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
     handlers=[logging.FileHandler("image_bot.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# ======================================================================
 
-# Конфигурация
+# ======================= КОНФИГУРАЦИЯ БОТА ===========================
+# Весовые коэффициенты для распределения поиска между источниками
 SOURCE_WEIGHTS = {
-    'imgur5': 0.1,
-    'imgur7': 0.2,
-    'prnt': 0.2,
-    'pastenow': 0.2,
-    'freeimage': 0.3
+    'imgur5': 0.1,   # 10% изображений с Imgur (5 символов)
+    'imgur7': 0.2,   # 20% изображений с Imgur (7 символов)
+    'prnt': 0.2,     # 20% изображений с prnt.sc
+    'pastenow': 0.2, # 20% изображений с paste.pics
+    'freeimage': 0.3 # 30% изображений с freeimage
 }
 
+# Размеры пакетов для проверки изображений
 BATCH_SIZES = {
     'imgur5': 5,
     'imgur7': 10,
@@ -45,20 +49,22 @@ BATCH_SIZES = {
     'freeimage': 10
 }
 
-SOURCE_TIMEOUT = 600  # 10 минут
-MAX_GROUP_SIZE = 10
-GROUP_TIMEOUT = 60    # 1 минута
-STATUS_UPDATE_INTERVAL = 10
-UPDATE_ON_FOUND = 5
-UPDATE_ON_CHECKED = 50
-MEDIA_SEND_TIMEOUT = 30
-REQUEST_TIMEOUT = 15
-MAX_CONCURRENT_TASKS = 30
-MAX_RETRIES = 3
-COOLDOWN_DURATION = 180  # 3 минуты
+# Основные параметры работы бота
+SOURCE_TIMEOUT = 600       # 10 минут блокировки источника после ошибки
+MAX_GROUP_SIZE = 10        # Максимальный размер медиагруппы
+GROUP_TIMEOUT = 60         # 1 минута ожидания для неполной группы
+STATUS_UPDATE_INTERVAL = 10 # Интервал обновления статуса (сек)
+UPDATE_ON_FOUND = 5        # Обновлять статус каждые N найденных изображений
+UPDATE_ON_CHECKED = 50     # Обновлять статус каждые N проверенных URL
+MEDIA_SEND_TIMEOUT = 60    # Таймаут отправки медиа (сек)
+MAX_CONCURRENT_TASKS = 30  # Макс. одновременных задач
+MAX_RETRIES = 3            # Макс. попыток повтора при ошибках
+COOLDOWN_DURATION = 180    # 3 минуты кулдауна между командами
+REQUEST_TIMEOUT = 15       # Таймаут HTTP-запросов (сек)
+# ======================================================================
 
 def format_time(seconds: int) -> str:
-    """Форматирование времени в читаемый вид"""
+    """Форматирует время в читаемый вид (чч:мм:сс)"""
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
     seconds = seconds % 60
@@ -70,9 +76,9 @@ def format_time(seconds: int) -> str:
         return f"{seconds}с"
 
 def get_source_name(source_type: str, length: int = None) -> str:
-    """Получение читаемого имени источника"""
+    """Возвращает читаемое имя источника для сообщений"""
     names = {
-        "imgur": f"Imgur ({length})" if length else "Imgur",
+        "imgur": f"Imgur ({length} симв.)" if length else "Imgur",
         "prnt": "Prnt.sc",
         "pastenow": "Paste.pics",
         "freeimage": "Freeimage",
@@ -82,23 +88,27 @@ def get_source_name(source_type: str, length: int = None) -> str:
 
 class ImageBot:
     def __init__(self):
+        # User-Agents для HTTP-запросов
         self.user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         ]
-        # Сессии по ключу (chat_id, user_id)
-        self.sessions: Dict[Tuple[int, int], Dict] = {}
-        self.last_commands: Dict[Tuple[int, int], Dict] = {}
-        self.media_groups: Dict[Tuple[int, int], Dict] = {}
-        self.sent_image_ids: Dict[Tuple[int, int], Set[str]] = {}
-        self.command_cooldowns: Dict[Tuple[int, int], float] = {}
-        self.source_errors: Dict[str, float] = {}
-        self.session = None
-        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+        
+        # Основные структуры данных
+        self.sessions: Dict[Tuple[int, int], Dict] = {}          # Активные сессии пользователей
+        self.last_commands: Dict[Tuple[int, int], Dict] = {}    # История команд
+        self.media_groups: Dict[Tuple[int, int], Dict] = {}     # Группы медиа для отправки
+        self.sent_image_ids: Dict[Tuple[int, int], Set[str]] = {} # Отправленные изображения
+        self.command_cooldowns: Dict[Tuple[int, int], float] = {} # Время последних команд
+        self.source_errors: Dict[str, float] = {}               # Ошибки источников
+        
+        # Ограничители
+        self.send_semaphore = asyncio.Semaphore(5)  # Ограничение одновременных отправок
+        self.session = None                         # HTTP-сессия
         self._session_initialized = False
 
     async def get_session(self):
-        """Ленивая инициализация HTTP сессии"""
+        """Инициализирует и возвращает HTTP-сессию"""
         if not self._session_initialized or (self.session and self.session.closed):
             timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             connector = aiohttp.TCPConnector(limit=50, force_close=True)
@@ -107,19 +117,18 @@ class ImageBot:
         return self.session
 
     async def cleanup(self):
-        """Очистка ресурсов при завершении"""
+        """Очищает ресурсы при завершении работы"""
         if self.session and not self.session.closed:
             await self.session.close()
-        # Остановка всех активных задач
         for key in list(self.sessions.keys()):
             await self.stop_session(key, "shutdown")
 
     def get_key(self, update: Update) -> Tuple[int, int]:
-        """Получение ключа пользователя/чата"""
+        """Возвращает ключ (chat_id, user_id) для идентификации пользователя"""
         return (update.effective_chat.id, update.effective_user.id)
 
     def extract_image_id(self, url: str) -> str:
-        """Извлечение ID изображения из URL"""
+        """Извлекает уникальный ID изображения из URL"""
         if "imgur.com" in url:
             return url.split("/")[-1].split(".")[0]
         elif "prnt.sc" in url or "prntscr.com" in url:
@@ -131,36 +140,32 @@ class ImageBot:
         return url.split("/")[-1][:10]
 
     async def check_cooldown(self, update: Update) -> bool:
-        """Проверка кулдауна между командами"""
+        """Проверяет кулдаун между командами"""
         key = self.get_key(update)
-        last_command_time = self.command_cooldowns.get(key, 0)
-        current_time = time.time()
-        remaining = (last_command_time + COOLDOWN_DURATION) - current_time
+        last_time = self.command_cooldowns.get(key, 0)
+        remaining = (last_time + COOLDOWN_DURATION) - time.time()
         
         if remaining > 0:
             await update.message.reply_text(
-                f"⚠️ Пожалуйста, подождите {format_time(int(remaining))} "
-                "перед отправкой следующей команды."
+                f"⚠️ Подождите {format_time(int(remaining))} перед следующей командой."
             )
             return True
         return False
 
     def generate_random_string(self, length: int) -> str:
-        """Генерация случайной строки"""
+        """Генерирует случайную строку из букв и цифр"""
         chars = string.ascii_lowercase + string.digits
         return "".join(random.choices(chars, k=length))
 
     async def check_image(self, url: str, source: str = "any") -> Tuple[Optional[str], Optional[str]]:
-        """Проверка доступности изображения"""
+        """Проверяет доступность изображения по URL"""
         try:
             session = await self.get_session()
             headers = {"User-Agent": random.choice(self.user_agents)}
             
-            # Пропуск известных неработающих URL
+            # Пропускаем известные нерабочие URL
             if "//st.prntscr.com" in url or "prntscr.com/placeholder" in url:
                 return url, None
-                
-            # Проверка для Imgur
             if "imgur.com" in url and ("/removed." in url or "/removed/" in url):
                 return url, None
                 
@@ -172,7 +177,6 @@ class ImageBot:
                 if 'image' not in content_type and 'video' not in content_type:
                     return url, None
                     
-                # Дополнительная проверка для Imgur
                 if 'imgur' in source and "removed" in str(response.url):
                     return url, None
                     
@@ -185,11 +189,11 @@ class ImageBot:
                     
             return url, None
         except Exception as e:
-            logger.error(f"Ошибка при проверке изображения: {str(e)}")
+            logger.error(f"Ошибка проверки изображения: {str(e)}")
             return url, None
 
     async def extract_prnt_image_url(self, code: str) -> Optional[str]:
-        """Извлечение URL изображения с prnt.sc"""
+        """Извлекает URL изображения с prnt.sc"""
         try:
             if self.is_source_disabled("prnt"):
                 return None
@@ -212,12 +216,12 @@ class ImageBot:
                 text = await response.text()
                 soup = BeautifulSoup(text, "html.parser")
                 
-                # Проверка на отсутствие изображения
+                # Проверяем наличие изображения
                 no_image_div = soup.find('div', class_='no-image')
                 if no_image_div:
                     return None
 
-                # Поиск основного изображения
+                # Ищем основное изображение
                 img_tag = soup.find("img", {"class": "screenshot-image"})
                 img_url = None
                 if img_tag and "src" in img_tag.attrs:
@@ -227,7 +231,7 @@ class ImageBot:
                     elif not img_url.startswith("http"):
                         return None
 
-                # Fallback: поиск через Open Graph
+                # Fallback через Open Graph
                 if not img_url:
                     meta = soup.find("meta", {"property": "og:image"})
                     if meta and meta.get("content"):
@@ -241,12 +245,12 @@ class ImageBot:
 
                 return img_url
         except Exception as e:
-            logger.error(f"Ошибка при парсинге prnt.sc: {str(e)}")
+            logger.error(f"Ошибка парсинга prnt.sc: {str(e)}")
             self.source_errors["prnt"] = time.time()
             return None
 
     async def extract_pastenow_image_url(self, code: str) -> Optional[str]:
-        """Извлечение URL изображения с paste.pics"""
+        """Извлекает URL изображения с paste.pics"""
         try:
             if self.is_source_disabled("pastenow"):
                 return None
@@ -262,7 +266,7 @@ class ImageBot:
                 text = await response.text()
                 soup = BeautifulSoup(text, "html.parser")
                 
-                # Поиск в основном контенте
+                # Ищем изображение в основном контенте
                 content_div = soup.find('div', id='content')
                 img_url = None
                 if content_div:
@@ -274,7 +278,7 @@ class ImageBot:
                         if "placeholder" in img_url or "logo" in img_url:
                             return None
                 
-                # Fallback: Open Graph
+                # Fallback через Open Graph
                 if not img_url:
                     meta = soup.find("meta", {"property": "og:image"})
                     if meta and meta.get("content"):
@@ -284,30 +288,29 @@ class ImageBot:
                 
                 return img_url if img_url else None
         except Exception as e:
-            logger.error(f"Ошибка при парсинге paste.pics: {str(e)}")
+            logger.error(f"Ошибка парсинга paste.pics: {str(e)}")
             self.source_errors["pastenow"] = time.time()
             return None
 
     async def add_to_media_group(self, update: Update, key: Tuple[int, int], url: str, ext: str, count: int, found: int, source: str):
-        """Добавление медиа в группу для отправки"""
+        """Добавляет изображение в группу для отправки"""
         try:
             # Извлекаем ID изображения
             image_id = self.extract_image_id(url)
             
-            # Форматируем подпись со ссылкой
+            # Форматируем подпись
             display_url = f"[{image_id}]({url})"
             caption = f"({found}/{count}) {display_url} [{source.upper()}]"
             
-            # Проверка дубликатов в рамках сессии
-            async with self.semaphore:
-                if key not in self.sent_image_ids:
-                    self.sent_image_ids[key] = set()
-                
-                if image_id in self.sent_image_ids[key]:
-                    logger.info(f"Изображение {image_id} уже отправлено, пропускаем")
-                    return
-                
-                self.sent_image_ids[key].add(image_id)
+            # Проверяем дубликаты
+            if key not in self.sent_image_ids:
+                self.sent_image_ids[key] = set()
+            
+            if image_id in self.sent_image_ids[key]:
+                logger.info(f"Изображение {image_id} уже отправлено, пропускаем")
+                return
+            
+            self.sent_image_ids[key].add(image_id)
             
             # GIF отправляем отдельно
             if ext == "gif":
@@ -315,109 +318,126 @@ class ImageBot:
                 await self.send_media(update, key, [media_item])
                 return
             
+            # Инициализируем группу, если нужно
+            if key not in self.media_groups:
+                self.media_groups[key] = {
+                    "media": [],
+                    "last_added": time.time(),
+                    "timer_task": None
+                }
+            
+            group = self.media_groups[key]
+            
+            # Проверяем дубликаты в текущей группе
+            for media in group["media"]:
+                media_id = self.extract_image_id(media.media)
+                if media_id == image_id:
+                    logger.info(f"Изображение {image_id} уже в группе, пропускаем")
+                    return
+            
             # Добавляем в группу
-            async with self.semaphore:
-                if key not in self.media_groups:
-                    self.media_groups[key] = {
-                        "media": [],
-                        "last_added": time.time()
-                    }
-                    asyncio.create_task(self.group_timer(update, key))
-                
-                group = self.media_groups[key]
-                
-                # Проверка дубликатов в группе
-                for media in group["media"]:
-                    media_id = self.extract_image_id(media.media)
-                    if media_id == image_id:
-                        logger.info(f"Изображение {image_id} уже в группе, пропускаем")
-                        return
-                
-                media_item = InputMediaPhoto(media=url, caption=caption, parse_mode="Markdown")
-                group["media"].append(media_item)
-                group["last_added"] = time.time()
-                
-                # Отправка при достижении максимального размера группы
-                if len(group["media"]) >= MAX_GROUP_SIZE:
-                    media_to_send = group["media"]
-                    group["media"] = []
-                    await self.send_media(update, key, media_to_send)
+            media_item = InputMediaPhoto(media=url, caption=caption, parse_mode="Markdown")
+            group["media"].append(media_item)
+            group["last_added"] = time.time()
+            
+            # Запускаем/перезапускаем таймер
+            if group["timer_task"] is None or group["timer_task"].done():
+                group["timer_task"] = asyncio.create_task(self.group_timer(update, key))
+            
+            # Отправляем при достижении лимита
+            if len(group["media"]) >= MAX_GROUP_SIZE:
+                media_to_send = group["media"]
+                group["media"] = []
+                await self.send_media(update, key, media_to_send)
         except Exception as e:
-            logger.error(f"Ошибка при добавлении в медиагруппу: {str(e)}")
+            logger.error(f"Ошибка добавления в медиагруппу: {str(e)}")
 
     async def send_media(self, update: Update, key: Tuple[int, int], media_group: List):
-        """Отправка медиагруппы с обработкой ошибок"""
+        """Отправляет медиагруппу с обработкой ошибок"""
         if not media_group:
             return
             
-        try:
-            # Разделяем медиа на фото и анимации (гифки)
-            photos = []
-            animations = []
-            for media in media_group:
-                if isinstance(media, InputMediaAnimation):
-                    animations.append(media)
-                else:
-                    photos.append(media)
+        async with self.send_semaphore:
+            try:
+                photos = [m for m in media_group if not isinstance(m, InputMediaAnimation)]
+                animations = [m for m in media_group if isinstance(m, InputMediaAnimation)]
+                
+                if photos:
+                    try:
+                        await update.message.reply_media_group(
+                            media=photos,
+                            parse_mode="Markdown",
+                            write_timeout=MEDIA_SEND_TIMEOUT,
+                            connect_timeout=MEDIA_SEND_TIMEOUT
+                        )
+                        logger.info(f"Отправлена группа из {len(photos)} фото пользователю {key}")
+                    except RetryAfter as e:
+                        wait_time = e.retry_after
+                        logger.warning(f"Flood control. Ждем {wait_time} сек.")
+                        await asyncio.sleep(wait_time)
+                        await update.message.reply_media_group(
+                            media=photos,
+                            parse_mode="Markdown",
+                            write_timeout=MEDIA_SEND_TIMEOUT,
+                            connect_timeout=MEDIA_SEND_TIMEOUT
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки медиагруппы: {str(e)}")
+                        for photo in photos:
+                            try:
+                                await update.message.reply_photo(
+                                    photo=photo.media,
+                                    caption=photo.caption,
+                                    parse_mode="Markdown",
+                                    write_timeout=MEDIA_SEND_TIMEOUT,
+                                    connect_timeout=MEDIA_SEND_TIMEOUT
+                                )
+                            except Exception as e:
+                                logger.error(f"Ошибка отправки фото: {str(e)}")
 
-            # Отправляем фото группой
-            if photos:
-                try:
-                    await update.message.reply_media_group(
-                        media=photos,
-                        parse_mode="Markdown"
-                    )
-                    logger.info(f"Отправлена группа из {len(photos)} фото пользователю {key}")
-                except Exception as e:
-                    logger.error(f"Ошибка отправки медиагруппы (фото): {str(e)}")
-                    # Попытка отправить по одному
-                    for photo in photos:
-                        try:
-                            await update.message.reply_photo(
-                                photo=photo.media,
-                                caption=photo.caption,
-                                parse_mode="Markdown"
-                            )
-                        except Exception as e:
-                            logger.error(f"Ошибка отправки одиночного фото: {str(e)}")
-
-            # Отправляем анимации по одной
-            for animation in animations:
-                try:
-                    await update.message.reply_animation(
-                        animation=animation.media,
-                        caption=animation.caption,
-                        parse_mode="Markdown"
-                    )
-                except Exception as e:
-                    logger.error(f"Ошибка отправки анимации: {str(e)}")
-        except Exception as e:
-            logger.error(f"Общая ошибка при отправке медиа: {str(e)}")
+                for animation in animations:
+                    try:
+                        await update.message.reply_animation(
+                            animation=animation.media,
+                            caption=animation.caption,
+                            parse_mode="Markdown",
+                            write_timeout=MEDIA_SEND_TIMEOUT,
+                            connect_timeout=MEDIA_SEND_TIMEOUT
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки анимации: {str(e)}")
+            except Exception as e:
+                logger.error(f"Общая ошибка отправки медиа: {str(e)}")
 
     async def group_timer(self, update: Update, key: Tuple[int, int]):
         """Таймер для отправки неполных групп"""
         try:
             while True:
-                await asyncio.sleep(5)
+                await asyncio.sleep(GROUP_TIMEOUT)
                 
-                # Проверка наличия группы
-                if key not in self.media_groups or not self.media_groups[key]["media"]:
+                if key not in self.media_groups:
+                    break
+                    
+                group = self.media_groups[key]
+                
+                if not group["media"]:
                     break
                 
-                group = self.media_groups[key]
                 current_time = time.time()
                 
-                # Проверка таймаута группы
-                if (current_time - group["last_added"]) > GROUP_TIMEOUT:
+                if (current_time - group["last_added"]) >= GROUP_TIMEOUT:
                     media_to_send = group["media"]
                     group["media"] = []
                     await self.send_media(update, key, media_to_send)
                     break
         except Exception as e:
-            logger.error(f"Ошибка в таймере группы: {str(e)}")
+            logger.error(f"Ошибка таймера группы: {str(e)}")
+        finally:
+            if key in self.media_groups:
+                self.media_groups[key]["timer_task"] = None
 
     async def show_main_menu(self, update: Update):
-        """Отображение главного меню"""
+        """Показывает главное меню с кнопками"""
         reply_keyboard = [
             ["ВСЕ ИСТОЧНИКИ"],
             ["PRNT.SC", "IMGUR"],
@@ -439,21 +459,15 @@ class ImageBot:
         await self.show_main_menu(update)
         await update.message.reply_text(
             """
-Привет! Я бот для поиска случайных изображений с различных сервисов.
+Привет! Я бот для поиска случайных изображений.
 
-Я создан @memory_not_found и могу искать изображения на:
-- Imgur (5 и 7 символов)
-- Prnt.sc
-- Paste.pics
-- FreeImage
-
-Используйте кнопки ниже для начала поиска или команды:
+Используйте кнопки или команды:
 /getimg <5|7> <1-50> - поиск на Imgur
 /getprnt <1-50> - поиск на prnt.sc
 /getpastenow <1-50> - поиск на paste.pics
 /getfreeimage <1-50> - поиск на freeimage
 /getall <1-50> - поиск на всех источниках
-/stop - остановить текущий поиск
+/stop - остановить поиск
 /repeat - повторить последний поиск
 
 ⚠️ Важно!
@@ -1754,14 +1768,14 @@ def main():
         with open("token.txt", "r") as f:
             token = f.read().strip()
     except FileNotFoundError:
-        logger.error("Файл token.txt не найден. Создайте файл с токеном бота.")
+        logger.error("Создайте файл token.txt с токеном бота")
         return
     except Exception as e:
-        logger.error(f"Ошибка при чтении token.txt: {str(e)}")
+        logger.error(f"Ошибка чтения token.txt: {str(e)}")
         return
 
     if not token:
-        logger.error("Токен бота не найден в файле token.txt")
+        logger.error("Токен бота не найден в token.txt")
         return
 
     # Настройка обработчиков сигналов
@@ -1782,7 +1796,7 @@ def main():
     application.add_handler(CommandHandler("repeat", bot.repeat_last_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
 
-    logger.info("Бот запущен и готов к работе")
+    logger.info("Бот запущен")
     print("Бот запущен. Нажмите Ctrl+C для остановки")
     
     # Запуск бота
@@ -1791,7 +1805,6 @@ def main():
     except KeyboardInterrupt:
         logger.info("Получен сигнал остановки")
     finally:
-        # Очистка ресурсов при завершении
         asyncio.get_event_loop().run_until_complete(bot.cleanup())
 
 if __name__ == "__main__":
