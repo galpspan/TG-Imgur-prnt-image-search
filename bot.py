@@ -6,7 +6,7 @@ import time
 import asyncio
 import requests
 from typing import List, Dict, Set, Tuple, Optional, Union
-from telegram import Update, ReplyKeyboardMarkup, InputMediaPhoto, Message, InputMediaAnimation
+from telegram import Update, ReplyKeyboardMarkup, InputMediaPhoto, InputMediaAnimation
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,8 +15,8 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import RetryAfter, BadRequest
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from telegram.error import RetryAfter, BadRequest, TelegramError
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
 logging.basicConfig(
@@ -132,7 +132,7 @@ class ImageBot:
         # Значение: временная метка последней ошибки (для временного отключения источника)
         self.source_errors: Dict[str, float] = {}
         # Количество попыток повтора при неудачной отправке медиагруппы
-        self.retry_attempts: int = 3
+        self.retry_attempts: int = 5
         # Между запросами к источникам проходит 15 секунд
         self.request_timeout = 15
 
@@ -319,7 +319,7 @@ class ImageBot:
                 logger.warning(f"Rate limit exceeded для пользователя {key}. Waiting {e.retry_after} seconds")
                 await asyncio.sleep(e.retry_after)
                 attempts += 1
-            except BadRequest as e:
+            except (BadRequest, TelegramError) as e:
                 logger.error(f"Ошибка при отправке группы медиа: {str(e)}")
                 for media in media_group:
                     try:
@@ -331,7 +331,7 @@ class ImageBot:
                         logger.error(f"Ошибка при отправке отдельного медиа: {str(e)}")
                 return True
             except Exception as e:
-                logger.error(f"Ошибка при отправке группы медиа: {str(e)}")
+                logger.error(f"Критическая ошибка при отправке группы медиа: {str(e)}")
                 attempts += 1
                 await asyncio.sleep(1)
                 
@@ -404,6 +404,7 @@ class ImageBot:
             await self.send_media_group(update, media_to_send, key)
 
     async def group_timer(self, update: Update, key: Tuple[int, int]):
+        start_time = time.time()
         while True:
             await asyncio.sleep(5)
             
@@ -415,7 +416,7 @@ class ImageBot:
                 last_found_time = session.get("last_found_time", 0)
             
             current_time = time.time()
-            if (current_time - last_found_time) > GROUP_TIMEOUT:
+            if (current_time - last_found_time) > GROUP_TIMEOUT or (current_time - start_time) > GROUP_TIMEOUT:
                 if key in self.media_groups and self.media_groups[key]:
                     media_to_send = self.media_groups[key]
                     self.media_groups[key] = []
@@ -479,11 +480,14 @@ class ImageBot:
             session = self.sessions[key]
             session["stop"] = True
     
-            if key in self.media_groups and self.media_groups[key]:
-                media_to_send = self.media_groups[key]
-                self.media_groups[key] = []
-                await self.send_media_group(update, media_to_send, key)
+            media_group = self.media_groups.get(key, [])
+            if key in self.media_groups:
+                del self.media_groups[key]
     
+        if media_group:
+            await self.send_media_group(update, media_group, key)
+    
+        async with self.lock:
             if not silent:
                 elapsed = int(time.time() - session["start_time"])
                 target = session["target_count"]
@@ -599,7 +603,15 @@ class ImageBot:
                 current_hash = hash(text)
                 
                 if force or last_text_hash != current_hash:
-                    await status_msg.edit_text(text)
+                    try:
+                        await status_msg.edit_text(text)
+                    except RetryAfter as e:
+                        logger.warning(f"Flood control при обновлении статуса. Ждем {e.retry_after} сек.")
+                        await asyncio.sleep(e.retry_after)
+                        await status_msg.edit_text(text)
+                    except Exception as e:
+                        if "not modified" not in str(e).lower():
+                            logger.error(f"Ошибка при обновлении статуса для {key}: {str(e)}")
                     session["last_text_hash"] = current_hash
                     self.sessions[key] = session
                     
@@ -737,6 +749,8 @@ class ImageBot:
                     
                     for result in results:
                         async with self.lock:
+                            if session.get("stop", False):
+                                return
                             session["analyzed"] += 1
                             analyzed = session["analyzed"]
                             self.sessions[key] = session
@@ -757,6 +771,8 @@ class ImageBot:
                                 continue
                         
                         async with self.lock:
+                            if session.get("stop", False):
+                                return
                             session["found"] += 1
                             session["sources"][source_type]["found"] += 1
                             session["last_found_time"] = time.time()
@@ -840,7 +856,10 @@ class ImageBot:
                         f"Время: {format_time(elapsed)}"
                     )
                     
-                    await update.message.reply_text(message)
+                    try:
+                        await update.message.reply_text(message)
+                    except Exception as e:
+                        logger.error(f"Ошибка при отправке финального сообщения: {str(e)}")
                     
                     self.cleanup_user_session(key)
                     await self.show_main_menu(update)
