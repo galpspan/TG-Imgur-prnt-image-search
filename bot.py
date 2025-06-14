@@ -119,7 +119,7 @@ class ImageBot:
         self.command_cooldowns: Dict[Tuple[int, int], float] = {}
         # Длительность кулдауна между командами (в секундах).
         # Пользователь не может отправлять команды чаще, чем раз в это время
-        self.cooldown_duration: int = 180
+        self.cooldown_duration: int = 180 #3 минуты кд
         # Исполнитель для запуска синхронных задач в отдельных потоках.
         # Позволяет выполнять блокирующие операции (например, HTTP-запросы)
         # без блокировки основного event loop'а
@@ -133,6 +133,8 @@ class ImageBot:
         self.source_errors: Dict[str, float] = {}
         # Количество попыток повтора при неудачной отправке медиагруппы
         self.retry_attempts: int = 3
+        # Между запросами к источникам проходит 15 секунд
+        self.request_timeout = 15
 
     def get_key(self, update: Update) -> Tuple[int, int]:
         return (update.effective_chat.id, update.effective_user.id)
@@ -164,7 +166,7 @@ class ImageBot:
 
     def generate_random_string(self, length: int) -> str:
         chars = string.ascii_lowercase + string.digits
-        return "".join(random.choice(chars) for _ in range(length))
+        return "".join(random.SystemRandom().choice(chars) for _ in range(length))
 
     async def check_image(self, url: str, source: str = "any") -> Tuple[Optional[str], Optional[str]]:
         try:
@@ -173,7 +175,7 @@ class ImageBot:
             
             head_response = await loop.run_in_executor(
                 self.executor, 
-                lambda: requests.head(url, headers=headers, timeout=10, allow_redirects=True)
+                lambda: requests.head(url, headers=headers, timeout=self.request_timeout, allow_redirects=True)
             )
             
             if head_response.status_code != 200:
@@ -213,7 +215,7 @@ class ImageBot:
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 self.executor, 
-                lambda: requests.get(url, headers=headers, timeout=10)
+                lambda: requests.get(url, headers=headers, timeout=self.request_timeout)
             )
             
             if response.status_code != 200:
@@ -259,7 +261,7 @@ class ImageBot:
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 self.executor, 
-                lambda: requests.get(url, headers=headers, timeout=10)
+                lambda: requests.get(url, headers=headers, timeout=self.request_timeout)
             )
             
             if response.status_code == 404:
@@ -302,6 +304,16 @@ class ImageBot:
             try:
                 await update.message.reply_media_group(media=media_group, parse_mode="Markdown")
                 logger.info(f"Отправлена группа из {len(media_group)} медиа пользователю {key}")
+                
+                async with self.lock:
+                    if key not in self.sent_image_ids:
+                        self.sent_image_ids[key] = set()
+                    
+                    for media in media_group:
+                        image_id = self.extract_image_id(media.caption)
+                        if image_id:
+                            self.sent_image_ids[key].add(image_id)
+                
                 return True
             except RetryAfter as e:
                 logger.warning(f"Rate limit exceeded для пользователя {key}. Waiting {e.retry_after} seconds")
@@ -329,9 +341,26 @@ class ImageBot:
     async def send_single_media(self, update: Update, url: str, caption: str, is_gif: bool, key: Tuple[int, int]):
         try:
             if is_gif:
-                await update.message.reply_animation(animation=url, caption=caption, parse_mode="Markdown")
+                message = await update.message.reply_animation(
+                    animation=url, 
+                    caption=caption, 
+                    parse_mode="Markdown"
+                )
             else:
-                await update.message.reply_photo(photo=url, caption=caption, parse_mode="Markdown")
+                message = await update.message.reply_photo(
+                    photo=url, 
+                    caption=caption, 
+                    parse_mode="Markdown"
+                )
+            
+            async with self.lock:
+                if key not in self.sent_image_ids:
+                    self.sent_image_ids[key] = set()
+                
+                image_id = self.extract_image_id(caption)
+                if image_id:
+                    self.sent_image_ids[key].add(image_id)
+                    
         except Exception as e:
             logger.error(f"Ошибка при отправке одиночного медиа: {str(e)}")
 
@@ -344,17 +373,16 @@ class ImageBot:
         display_url = f"[{image_id}]({url})"
         caption = f"({found}/{count}) {display_url} [{source.upper()}]"
         
-        if key not in self.sent_image_ids:
-            self.sent_image_ids[key] = set()
-        
-        if image_id and image_id in self.sent_image_ids[key]:
-            logger.info(f"Изображение {image_id} уже отправлено, пропускаем")
-            return
+        async with self.lock:
+            if key not in self.sent_image_ids:
+                self.sent_image_ids[key] = set()
+            
+            if image_id and image_id in self.sent_image_ids[key]:
+                logger.info(f"Изображение {image_id} уже отправлено, пропускаем")
+                return
         
         if ext == "gif":
             await self.send_single_media(update, url, caption, True, key)
-            if image_id:
-                self.sent_image_ids[key].add(image_id)
             return
         
         if key not in self.media_groups:
@@ -369,8 +397,6 @@ class ImageBot:
         
         media_item = InputMediaPhoto(media=url, caption=caption, parse_mode="Markdown")
         self.media_groups[key].append(media_item)
-        if image_id:
-            self.sent_image_ids[key].add(image_id)
         
         if len(self.media_groups[key]) >= MAX_GROUP_SIZE:
             media_to_send = self.media_groups[key]
@@ -433,6 +459,12 @@ class ImageBot:
 /getall <1-50> - поиск на всех источниках
 /stop - остановить текущий поиск
 /repeat - повторить последний поиск
+
+⚠️ Важно!
+
+В некоторых источниках могут встречаться неприятные, шокирующие или NSFW-материалы. Используйте бота на свой страх и риск.
+
+Если вам попался нежелательный контент – просто пропустите его. Будьте осторожны!
 """
         )
 
@@ -563,9 +595,17 @@ class ImageBot:
                     f"Время: {format_time(int(current_time - session['start_time']))}"
                 )
                 
-                await status_msg.edit_text(text)
+                last_text_hash = session.get("last_text_hash")
+                current_hash = hash(text)
+                
+                if force or last_text_hash != current_hash:
+                    await status_msg.edit_text(text)
+                    session["last_text_hash"] = current_hash
+                    self.sessions[key] = session
+                    
             except Exception as e:
-                logger.error(f"Ошибка при обновлении статуса для {key}: {str(e)}")
+                if "not modified" not in str(e).lower():
+                    logger.error(f"Ошибка при обновлении статуса для {key}: {str(e)}")
 
     def is_source_disabled(self, source: str) -> bool:
         if source in self.source_errors:
