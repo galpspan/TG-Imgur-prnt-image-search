@@ -19,49 +19,57 @@ from bs4 import BeautifulSoup
 import signal
 import sys
 
+# ======================= НАСТРОЙКИ ЛОГИРОВАНИЯ =======================
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-# ======================= НАСТРОЙКИ ЛОГИРОВАНИЯ =======================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
     handlers=[logging.FileHandler("image_bot.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
-# ======================================================================
 
 # ======================= КОНФИГУРАЦИЯ БОТА ===========================
 # Весовые коэффициенты для распределения поиска между источниками
+# Определяют вероятность выбора каждого источника при поиске
+# Сумма всех значений должна быть равна 1.0 (100%)
 SOURCE_WEIGHTS = {
-    'imgur5': 0.1,   # 10% изображений с Imgur (5 символов)
-    'imgur7': 0.2,   # 20% изображений с Imgur (7 символов)
-    'prnt': 0.2,     # 20% изображений с prnt.sc
-    'pastenow': 0.2, # 20% изображений с paste.pics
-    'freeimage': 0.3 # 30% изображений с freeimage
+    'imgur5': 0.1,   # 10% - Imgur с 5-символьными кодами
+    'imgur7': 0.2,   # 20% - Imgur с 7-символьными кодами  
+    'prnt': 0.2,     # 20% - Prnt.sc
+    'pastenow': 0.2, # 20% - Paste.pics
+    'freeimage': 0.3 # 30% - Freeimage (самый высокий приоритет)
 }
 
 # Размеры пакетов для проверки изображений
+# Сколько URL генерировать и проверять за один раз для каждого источника
 BATCH_SIZES = {
-    'imgur5': 5,
-    'imgur7': 10,
-    'prnt': 10,
-    'pastenow': 10,
-    'freeimage': 10
+    'imgur5': 5,    # 5 URL за раз для Imgur5
+    'imgur7': 10,   # 10 URL за раз для Imgur7
+    'prnt': 10,     # 10 кодов за раз для Prnt.sc
+    'pastenow': 10, # 10 кодов за раз для Paste.pics
+    'freeimage': 10 # 10 URL за раз для Freeimage
 }
 
-# Основные параметры работы бота
-SOURCE_TIMEOUT = 600       # 10 минут блокировки источника после ошибки
-MAX_GROUP_SIZE = 10        # Максимальный размер медиагруппы
-GROUP_TIMEOUT = 60         # 1 минута ожидания для неполной группы
-STATUS_UPDATE_INTERVAL = 10 # Интервал обновления статуса (сек)
-UPDATE_ON_FOUND = 5        # Обновлять статус каждые N найденных изображений
-UPDATE_ON_CHECKED = 50     # Обновлять статус каждые N проверенных URL
-MEDIA_SEND_TIMEOUT = 60    # Таймаут отправки медиа (сек)
-MAX_CONCURRENT_TASKS = 30  # Макс. одновременных задач
-MAX_RETRIES = 3            # Макс. попыток повтора при ошибках
-COOLDOWN_DURATION = 180    # 3 минуты кулдауна между командами
-REQUEST_TIMEOUT = 15       # Таймаут HTTP-запросов (сек)
+# Время блокировки источника после ошибки (в секундах)
+SOURCE_TIMEOUT = 600  # 10 минут
+
+# Настройки группировки медиа при отправке
+MAX_GROUP_SIZE = 10    # Макс. количество изображений в одном сообщении
+GROUP_TIMEOUT = 60     # 1 минута - ждем наполнения группы перед отправкой
+
+# Настройки обновления статуса
+STATUS_UPDATE_INTERVAL = 10  # Обновлять статус каждые 10 секунд
+UPDATE_ON_FOUND = 5          # Обновлять статус каждые 5 найденных изображений
+UPDATE_ON_CHECKED = 50       # Обновлять статус каждые 50 проверенных URL
+
+# Таймауты и ограничения
+MEDIA_SEND_TIMEOUT = 60     # 60 сек на отправку медиа в Telegram
+MAX_CONCURRENT_TASKS = 30   # Макс. одновременных задач проверки URL
+MAX_RETRIES = 3             # Макс. попыток при ошибках
+COOLDOWN_DURATION = 180     # 3 минуты кулдауна между командами
+REQUEST_TIMEOUT = 15        # 15 сек таймаут HTTP-запросов
 # ======================================================================
 
 def format_time(seconds: int) -> str:
@@ -92,17 +100,15 @@ class ImageBot:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         ]
         
-        # Основные структуры данных
-        self.sessions: Dict[Tuple[int, int], Dict] = {}          # Активные сессии пользователей
-        self.last_commands: Dict[Tuple[int, int], Dict] = {}    # История команд
-        self.media_groups: Dict[Tuple[int, int], Dict] = {}     # Группы медиа для отправки
-        self.sent_image_ids: Dict[Tuple[int, int], Set[str]] = {} # Отправленные изображения
-        self.command_cooldowns: Dict[Tuple[int, int], float] = {} # Время последних команд
-        self.source_errors: Dict[str, float] = {}               # Ошибки источников
+        self.sessions = {}
+        self.last_commands = {}
+        self.media_groups = {}
+        self.sent_image_ids = {}
+        self.command_cooldowns = {}
+        self.source_errors = {}
         
-        # Ограничители
-        self.send_semaphore = asyncio.Semaphore(5)  # Ограничение одновременных отправок
-        self.session = None                         # HTTP-сессия
+        self.send_semaphore = asyncio.Semaphore(5)
+        self.session = None
         self._session_initialized = False
 
     async def get_session(self):
@@ -149,38 +155,44 @@ class ImageBot:
         chars = string.ascii_lowercase + string.digits
         return "".join(random.choices(chars, k=length))
 
-    async def check_image(self, url: str, source: str = "any") -> Tuple[Optional[str], Optional[str]]:
+    async def check_image(self, url: str, source: str) -> Tuple[Optional[str], Optional[str]]:
         try:
             session = await self.get_session()
             headers = {"User-Agent": random.choice(self.user_agents)}
             
-            if "//st.prntscr.com" in url or "prntscr.com/placeholder" in url:
-                return url, None
-            if "imgur.com" in url and ("/removed." in url or "/removed/" in url):
-                return url, None
+            if any(x in url.lower() for x in ["placeholder", "removed", "error", "404"]):
+                return None, None
                 
-            async with session.head(url, headers=headers, allow_redirects=True) as response:
-                if response.status != 200:
-                    return url, None
+            try:
+                async with session.head(url, headers=headers, 
+                                     allow_redirects=True,
+                                     timeout=aiohttp.ClientTimeout(total=10)) as response:
                     
-                content_type = response.headers.get("content-type", "").lower()
-                if 'image' not in content_type and 'video' not in content_type:
-                    return url, None
+                    if response.status != 200:
+                        return None, None
+                        
+                    content_type = response.headers.get("content-type", "").lower()
+                    if not any(x in content_type for x in ['image', 'video']):
+                        return None, None
                     
-                if 'imgur' in source and "removed" in str(response.url):
-                    return url, None
+                    final_url = str(response.url)
+                    if any(x in final_url.lower() for x in ["removed", "deleted", "error"]):
+                        return None, None
                     
-                if 'gif' in content_type:
-                    return url, 'gif'
-                elif 'jpeg' in content_type or 'jpg' in content_type:
-                    return url, 'jpg'
-                elif 'png' in content_type:
-                    return url, 'png'
-                    
-            return url, None
+                    if 'gif' in content_type:
+                        return final_url, 'gif'
+                    elif 'jpeg' in content_type or 'jpg' in content_type:
+                        return final_url, 'jpg'
+                    elif 'png' in content_type:
+                        return final_url, 'png'
+                        
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logger.warning(f"Timeout/connection error for {url}: {str(e)}")
+                return None, None
+                
         except Exception as e:
-            logger.error(f"Ошибка проверки изображения: {str(e)}")
-            return url, None
+            logger.error(f"Error checking image {url}: {str(e)}")
+        return None, None
 
     async def extract_prnt_image_url(self, code: str) -> Optional[str]:
         try:
@@ -198,57 +210,53 @@ class ImageBot:
                 "Upgrade-Insecure-Requests": "1"
             }
             
-            async with session.get(url, headers=headers) as response:
-                if response.status != 200:
-                    return None
-
-                text = await response.text()
-                soup = BeautifulSoup(text, "html.parser")
-                
-                # Проверка на отсутствие изображения
-                no_image_div = soup.find('div', class_='no-image')
-                if no_image_div:
-                    return None
-
-                # Поиск тега изображения
-                img_tag = soup.find("img", {"class": "screenshot-image"})
-                img_url = None
-                
-                # Извлечение URL из тега изображения
-                if img_tag and "src" in img_tag.attrs:
-                    img_url = img_tag["src"]
-                    
-                    # Обработка относительных URL
-                    if img_url.startswith("//"):
-                        img_url = f"https:{img_url}"
-                    elif not img_url.startswith("http"):
+            try:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status != 200:
                         return None
                         
-                    # Проверка на placeholder
-                    if "prntscr.com/placeholder" in img_url.lower() or "st.prntscr.com" in img_url.lower():
-                        return None
+                    text = await response.text()
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logger.warning(f"Prnt.sc connection error: {str(e)}")
+                self.source_errors["prnt"] = time.time()
+                return None
 
-                # Если не нашли через тег, пробуем через мета-теги
-                if not img_url:
-                    meta = soup.find("meta", {"property": "og:image"})
-                    if meta and meta.get("content"):
-                        img_url = meta["content"]
-                        if img_url.startswith("//"):
-                            img_url = f"https:{img_url}"
-                        elif not img_url.startswith("http"):
-                            return None
+            soup = BeautifulSoup(text, "html.parser")
+            
+            no_image_div = soup.find('div', class_='no-image')
+            if no_image_div:
+                return None
 
-                # Фильтрация невалидных URL
-                if not img_url or "prntscr.com/placeholder" in img_url.lower() or "st.prntscr.com" in img_url.lower():
+            img_url = None
+            img_tag = soup.find("img", {"class": "screenshot-image"})
+            
+            if img_tag and img_tag.get("src"):
+                img_url = img_tag["src"]
+                if any(x in img_url.lower() for x in ["placeholder", "st.prntscr.com"]):
                     return None
+            else:
+                meta_image = soup.find("meta", property="og:image")
+                if meta_image and meta_image.get("content"):
+                    img_url = meta_image["content"]
 
-                # Дополнительная проверка, что это прямая ссылка на изображение
-                if "prnt.sc" in img_url:
-                    return None
-                    
-                return img_url
+            if not img_url:
+                return None
+                
+            if img_url.startswith("//"):
+                img_url = f"https:{img_url}"
+            elif not img_url.startswith("http"):
+                return None
+                
+            if any(x in img_url.lower() for x in ["prnt.sc", "prntscr.com/placeholder", "st.prntscr.com"]):
+                return None
+                
+            if "removed.png" in img_url.lower():
+                return None
+                
+            return img_url
+            
         except Exception as e:
-            logger.error(f"Ошибка парсинга prnt.sc: {str(e)}")
+            logger.error(f"Prnt.sc parsing error: {str(e)}")
             self.source_errors["prnt"] = time.time()
             return None
 
@@ -258,38 +266,95 @@ class ImageBot:
                 return None
                 
             session = await self.get_session()
-            url = f"https://ru.paste.pics/{code}"
+            url = f"https://paste.pics/{code}"
+            headers = {
+                "User-Agent": random.choice(self.user_agents),
+                "Referer": "https://paste.pics/",
+            }
+            
+            try:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status != 200:
+                        return None
+                        
+                    text = await response.text()
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logger.warning(f"PasteNow connection error: {str(e)}")
+                self.source_errors["pastenow"] = time.time()
+                return None
+
+            soup = BeautifulSoup(text, "html.parser")
+            
+            img_url = None
+            for tag in soup.find_all(['img', 'meta']):
+                if tag.name == 'img' and tag.get('src'):
+                    img_url = tag['src']
+                    if any(x in img_url.lower() for x in ["logo", "placeholder"]):
+                        continue
+                    break
+                elif tag.name == 'meta' and tag.get('property') == 'og:image':
+                    img_url = tag.get('content')
+                    break
+                    
+            if not img_url:
+                return None
+                
+            if img_url.startswith("//"):
+                img_url = f"https:{img_url}"
+            elif not img_url.startswith("http"):
+                return None
+                
+            return img_url
+            
+        except Exception as e:
+            logger.error(f"PasteNow parsing error: {str(e)}")
+            self.source_errors["pastenow"] = time.time()
+            return None
+
+    async def extract_imgur_image_url(self, code: str, length: int) -> Optional[str]:
+        try:
+            url = f"https://i.imgur.com/{code}.jpg"
+            
+            session = await self.get_session()
             headers = {"User-Agent": random.choice(self.user_agents)}
             
-            async with session.get(url, headers=headers) as response:
+            async with session.head(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 404:
                     return None
                     
-                text = await response.text()
-                soup = BeautifulSoup(text, "html.parser")
-                
-                content_div = soup.find('div', id='content')
-                img_url = None
-                if content_div:
-                    img_tag = content_div.find('img', src=True)
-                    if img_tag:
-                        img_url = img_tag['src']
-                        if not img_url.startswith('http'):
-                            img_url = 'https:' + img_url
-                        if "placeholder" in img_url or "logo" in img_url:
-                            return None
-                
-                if not img_url:
-                    meta = soup.find("meta", {"property": "og:image"})
-                    if meta and meta.get("content"):
-                        img_url = meta["content"]
-                        if not img_url.startswith('http'):
-                            img_url = 'https:' + img_url
-                
-                return img_url if img_url else None
+                final_url = str(response.url)
+                if "removed" in final_url.lower():
+                    return None
+                    
+            return url
+            
         except Exception as e:
-            logger.error(f"Ошибка парсинга paste.pics: {str(e)}")
-            self.source_errors["pastenow"] = time.time()
+            logger.error(f"Imgur check error: {str(e)}")
+            return None
+
+    async def extract_freeimage_url(self, code: str) -> Optional[str]:
+        try:
+            url = f"https://iili.io/{code}.jpg"
+            
+            session = await self.get_session()
+            headers = {"User-Agent": random.choice(self.user_agents)}
+            
+            async with session.head(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 404:
+                    return None
+                    
+                final_url = str(response.url)
+                if any(x in final_url.lower() for x in ["error", "404", "removed"]):
+                    return None
+                    
+                content_type = response.headers.get("content-type", "").lower()
+                if not content_type.startswith("image/"):
+                    return None
+                    
+            return url
+            
+        except Exception as e:
+            logger.error(f"FreeImage check error: {str(e)}")
             return None
 
     async def add_to_media_group(self, update: Update, key: Tuple[int, int], url: str, ext: str, count: int, found: int, source: str):
@@ -714,33 +779,31 @@ class ImageBot:
                 
                 urls_to_check = []
                 if source_type in ["imgur5", "imgur7"]:
-                    for _ in range(batch_size):
-                        code = self.generate_random_string(length)
-                        urls_to_check.append(f"https://i.imgur.com/{code}.jpg")
+                    tasks = [self.extract_imgur_image_url(self.generate_random_string(length), length) 
+                            for _ in range(batch_size)]
                 elif source_type == "prnt":
-                    urls_to_check = [self.generate_random_string(6) for _ in range(batch_size)]
+                    tasks = [self.extract_prnt_image_url(self.generate_random_string(6))
+                            for _ in range(batch_size)]
                 elif source_type == "pastenow":
-                    urls_to_check = [self.generate_random_string(5) for _ in range(batch_size)]
+                    tasks = [self.extract_pastenow_image_url(self.generate_random_string(5))
+                            for _ in range(batch_size)]
                 elif source_type == "freeimage":
-                    for _ in range(batch_size):
-                        code = self.generate_random_string(7)
-                        urls_to_check.append(f"https://iili.io/{code}.jpg")
+                    tasks = [self.extract_freeimage_url(self.generate_random_string(7))
+                            for _ in range(batch_size)]
                 
                 try:
-                    results = []
-                    if source_type in ["imgur5", "imgur7", "freeimage"]:
-                        tasks = [self.check_image(url, source_type) for url in urls_to_check]
-                        results = await asyncio.gather(*tasks)
-                    elif source_type == "prnt":
-                        tasks = [self.extract_prnt_image_url(code) for code in urls_to_check]
-                        results = await asyncio.gather(*tasks)
-                    elif source_type == "pastenow":
-                        tasks = [self.extract_pastenow_image_url(code) for code in urls_to_check]
-                        results = await asyncio.gather(*tasks)
+                    results = await asyncio.gather(*tasks)
                     
-                    for result in results:
+                    for url in results:
                         if session.get("stop", False) or session["found"] >= count:
                             break
+                            
+                        if not url:
+                            continue
+                            
+                        _, ext = await self.check_image(url, source_type)
+                        if not ext:
+                            continue
                             
                         session["analyzed"] += 1
                         analyzed = session["analyzed"]
@@ -752,18 +815,6 @@ class ImageBot:
                         if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
                             await self.update_status_message(key)
                             last_update_time = current_time
-                        
-                        if source_type in ["imgur5", "imgur7", "freeimage"]:
-                            url, ext = result
-                            if not ext:
-                                continue
-                        else:
-                            url = result
-                            if not url:
-                                continue
-                            _, ext = await self.check_image(url, source_type)
-                            if not ext:
-                                continue
                         
                         session["found"] += 1
                         session["sources"][source_type]["found"] += 1
@@ -852,7 +903,6 @@ class ImageBot:
                 await self.show_main_menu(update)
 
     async def get_imgur_images(self, update: Update, context: CallbackContext):
-        """Поиск изображений на Imgur"""
         key = self.get_key(update)
         
         if await self.check_cooldown(update):
@@ -878,7 +928,6 @@ class ImageBot:
             await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
-        # Проверка активного идентичного поиска
         if key in self.sessions:
             current_session = self.sessions[key]
             if (current_session["source_type"] == "imgur" and 
@@ -887,12 +936,10 @@ class ImageBot:
                 await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
                 return
         
-        # Остановка предыдущего поиска
         if key in self.sessions:
             await self.stop(update, context, silent=True)
             await asyncio.sleep(1)
         
-        # Создание новой сессии
         status_msg = await update.message.reply_text(
             f"🔍 Поиск Imgur начат\n"
             f"Длина: {length}\n"
@@ -921,15 +968,11 @@ class ImageBot:
 
         await self.show_main_menu(update)
         
-        # Логирование начала поиска
-        source_name = get_source_name("imgur", length)
-        logger.info(f"Поиск пользователя {key} начат. Источник: {source_name}. Цель: {count} изображений")
+        logger.info(f"Поиск пользователя {key} начат. Imgur ({length}). Цель: {count} изображений")
         
-        # Запуск поиска
         asyncio.create_task(self._search_imgur(update, key, length, count))
 
     async def _search_imgur(self, update: Update, key: Tuple[int, int], length: int, count: int):
-        """Внутренний метод поиска на Imgur"""
         try:
             session = self.sessions[key]
             session["task"] = asyncio.current_task()
@@ -937,44 +980,39 @@ class ImageBot:
             retries = 0
             
             while not session.get("stop", False) and session["found"] < count:
-                # Генерация URL
                 code = self.generate_random_string(length)
-                url = f"https://i.imgur.com/{code}.jpg"
                 
                 try:
-                    # Проверка изображения
+                    url = await self.extract_imgur_image_url(code, length)
+                    if not url:
+                        continue
+                        
                     _, ext = await self.check_image(url, "imgur")
-                    
-                    # Обновление счетчика
+                    if not ext:
+                        continue
+                        
                     session["analyzed"] += 1
                     analyzed = session["analyzed"]
                     
-                    # Обновление статуса
                     if analyzed % UPDATE_ON_CHECKED == 0:
                         await self.update_status_message(key, force=True)
                     
-                    # Регулярное обновление статуса
                     current_time = time.time()
                     if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
                         await self.update_status_message(key)
                         last_update_time = current_time
                     
-                    # Если изображение валидно
-                    if ext:
-                        session["found"] += 1
-                        session["last_found_time"] = time.time()
-                        found = session["found"]
-                        
-                        # Добавление в медиагруппу
-                        await self.add_to_media_group(
-                            update, key, url, ext, count, found, "imgur"
-                        )
-                        
-                        # Обновление статуса
-                        if found % UPDATE_ON_FOUND == 0:
-                            await self.update_status_message(key, force=True)
+                    session["found"] += 1
+                    session["last_found_time"] = time.time()
+                    found = session["found"]
                     
-                    # Сброс счетчика ошибок
+                    await self.add_to_media_group(
+                        update, key, url, ext, count, found, "imgur"
+                    )
+                    
+                    if found % UPDATE_ON_FOUND == 0:
+                        await self.update_status_message(key, force=True)
+                    
                     retries = 0
                     await asyncio.sleep(0.1)
                     
@@ -992,11 +1030,9 @@ class ImageBot:
         except Exception as e:
             logger.error(f"Ошибка при поиске Imgur: {str(e)}")
         finally:
-            # Отправка оставшихся медиа
             if key in self.media_groups and self.media_groups[key].get("media"):
                 await self.send_media(update, key, self.media_groups[key]["media"])
             
-            # Финализация сессии
             if key in self.sessions:
                 session = self.sessions[key]
                 elapsed = int(time.time() - session["start_time"])
@@ -1005,13 +1041,11 @@ class ImageBot:
                 analyzed = session.get("analyzed", 0)
                 stop_reason = session.get("stop_reason", "")
                 
-                # Логирование завершения
                 if stop_reason == "source_disabled":
                     logger.info(f"Поиск пользователя {key} остановлен из-за недоступности источника. Время: {format_time(elapsed)}")
                 else:
                     logger.info(f"Поиск пользователя {key} завершен. Найдено: {found}/{target}. Время: {format_time(elapsed)}")
                 
-                # Формирование итогового сообщения
                 source_name = get_source_name(session["source_type"], session["length"])
                 message = (
                     f"✅ Поиск {source_name} завершен\n"
@@ -1021,18 +1055,15 @@ class ImageBot:
                     f"Время: {format_time(elapsed)}"
                 )
                 
-                # Отправка сообщения
                 try:
                     await update.message.reply_text(message)
                 except Exception as e:
                     logger.error(f"Ошибка при отправке финального сообщения: {str(e)}")
                 
-                # Очистка
                 self.cleanup_user_session(key)
                 await self.show_main_menu(update)
 
     async def get_prnt_images(self, update: Update, context: CallbackContext):
-        """Поиск изображений на prnt.sc"""
         key = self.get_key(update)
         
         if await self.check_cooldown(update):
@@ -1053,7 +1084,6 @@ class ImageBot:
             await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
-        # Проверка активного идентичного поиска
         if key in self.sessions:
             current_session = self.sessions[key]
             if (current_session["source_type"] == "prnt" and 
@@ -1061,12 +1091,10 @@ class ImageBot:
                 await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
                 return
         
-        # Остановка предыдущего поиска
         if key in self.sessions:
             await self.stop(update, context, silent=True)
             await asyncio.sleep(1)
         
-        # Создание новой сессии
         status_msg = await update.message.reply_text(
             f"🔍 Поиск prnt.sc начат\n"
             f"Цель: {count} изображений\n"
@@ -1093,15 +1121,11 @@ class ImageBot:
 
         await self.show_main_menu(update)
         
-        # Логирование начала поиска
-        source_name = get_source_name("prnt")
-        logger.info(f"Поиск пользователя {key} начат. Источник: {source_name}. Цель: {count} изображений")
+        logger.info(f"Поиск пользователя {key} начат. Prnt.sc. Цель: {count} изображений")
         
-        # Запуск поиска
         asyncio.create_task(self._search_prnt(update, key, count))
 
     async def _search_prnt(self, update: Update, key: Tuple[int, int], count: int):
-        """Внутренний метод поиска на prnt.sc"""
         try:
             session = self.sessions[key]
             session["task"] = asyncio.current_task()
@@ -1123,37 +1147,31 @@ class ImageBot:
                         continue
                         
                     _, ext = await self.check_image(url, "prnt")
-                    
-                    # Обновление счетчика
+                    if not ext:
+                        continue
+                        
                     session["analyzed"] += 1
                     analyzed = session["analyzed"]
                     
-                    # Обновление статуса
                     if analyzed % UPDATE_ON_CHECKED == 0:
                         await self.update_status_message(key, force=True)
                     
-                    # Регулярное обновление статуса
                     current_time = time.time()
                     if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
                         await self.update_status_message(key)
                         last_update_time = current_time
                     
-                    # Если изображение валидно
-                    if ext:
-                        session["found"] += 1
-                        session["last_found_time"] = time.time()
-                        found = session["found"]
-                        
-                        # Добавление в медиагруппу
-                        await self.add_to_media_group(
-                            update, key, url, ext, count, found, "prnt"
-                        )
-                        
-                        # Обновление статуса
-                        if found % UPDATE_ON_FOUND == 0:
-                            await self.update_status_message(key, force=True)
+                    session["found"] += 1
+                    session["last_found_time"] = time.time()
+                    found = session["found"]
                     
-                    # Сброс счетчика ошибок
+                    await self.add_to_media_group(
+                        update, key, url, ext, count, found, "prnt"
+                    )
+                    
+                    if found % UPDATE_ON_FOUND == 0:
+                        await self.update_status_message(key, force=True)
+                    
                     retries = 0
                     await asyncio.sleep(0.1)
                     
@@ -1171,11 +1189,9 @@ class ImageBot:
         except Exception as e:
             logger.error(f"Ошибка при поиске prnt.sc: {str(e)}")
         finally:
-            # Отправка оставшихся медиа
             if key in self.media_groups and self.media_groups[key].get("media"):
                 await self.send_media(update, key, self.media_groups[key]["media"])
             
-            # Финализация сессии
             if key in self.sessions:
                 session = self.sessions[key]
                 elapsed = int(time.time() - session["start_time"])
@@ -1183,12 +1199,6 @@ class ImageBot:
                 found = session.get("found", 0)
                 analyzed = session.get("analyzed", 0)
                 stop_reason = session.get("stop_reason", "")
-                
-                # Логирование завершения
-                if stop_reason == "source_disabled":
-                    logger.info(f"Поиск пользователя {key} остановлен из-за недоступности источника. Время: {format_time(elapsed)}")
-                else:
-                    logger.info(f"Поиск пользователя {key} завершен. Найдено: {found}/{target}. Время: {format_time(elapsed)}")
                 
                 if session.get("stop", False) and found < target:
                     text = f"🔴 Поиск остановлен\n"
@@ -1211,12 +1221,10 @@ class ImageBot:
                 
                 await update.message.reply_text(text)
                 
-                # Очистка
                 self.cleanup_user_session(key)
                 await self.show_main_menu(update)
 
     async def get_pastenow_images(self, update: Update, context: CallbackContext):
-        """Поиск изображений на paste.pics"""
         key = self.get_key(update)
         
         if await self.check_cooldown(update):
@@ -1237,7 +1245,6 @@ class ImageBot:
             await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
-        # Проверка активного идентичного поиска
         if key in self.sessions:
             current_session = self.sessions[key]
             if (current_session["source_type"] == "pastenow" and 
@@ -1245,12 +1252,10 @@ class ImageBot:
                 await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
                 return
         
-        # Остановка предыдущего поиска
         if key in self.sessions:
             await self.stop(update, context, silent=True)
             await asyncio.sleep(1)
         
-        # Создание новой сессии
         status_msg = await update.message.reply_text(
             f"🔍 Поиск paste.pics начат\n"
             f"Цель: {count} изображений\n"
@@ -1277,15 +1282,11 @@ class ImageBot:
 
         await self.show_main_menu(update)
         
-        # Логирование начала поиска
-        source_name = get_source_name("pastenow")
-        logger.info(f"Поиск пользователя {key} начат. Источник: {source_name}. Цель: {count} изображений")
+        logger.info(f"Поиск пользователя {key} начат. Paste.pics. Цель: {count} изображений")
         
-        # Запуск поиска
         asyncio.create_task(self._search_pastenow(update, key, count))
 
     async def _search_pastenow(self, update: Update, key: Tuple[int, int], count: int):
-        """Внутренний метод поиска на paste.pics"""
         try:
             session = self.sessions[key]
             session["task"] = asyncio.current_task()
@@ -1307,37 +1308,31 @@ class ImageBot:
                         continue
                         
                     _, ext = await self.check_image(url, "pastenow")
-                    
-                    # Обновление счетчика
+                    if not ext:
+                        continue
+                        
                     session["analyzed"] += 1
                     analyzed = session["analyzed"]
                     
-                    # Обновление статуса
                     if analyzed % UPDATE_ON_CHECKED == 0:
                         await self.update_status_message(key, force=True)
                     
-                    # Регулярное обновление статуса
                     current_time = time.time()
                     if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
                         await self.update_status_message(key)
                         last_update_time = current_time
                     
-                    # Если изображение валидно
-                    if ext:
-                        session["found"] += 1
-                        session["last_found_time"] = time.time()
-                        found = session["found"]
-                        
-                        # Добавление в медиагруппу
-                        await self.add_to_media_group(
-                            update, key, url, ext, count, found, "pastenow"
-                        )
-                        
-                        # Обновление статуса
-                        if found % UPDATE_ON_FOUND == 0:
-                            await self.update_status_message(key, force=True)
+                    session["found"] += 1
+                    session["last_found_time"] = time.time()
+                    found = session["found"]
                     
-                    # Сброс счетчика ошибок
+                    await self.add_to_media_group(
+                        update, key, url, ext, count, found, "pastenow"
+                    )
+                    
+                    if found % UPDATE_ON_FOUND == 0:
+                        await self.update_status_message(key, force=True)
+                    
                     retries = 0
                     await asyncio.sleep(0.1)
                     
@@ -1355,11 +1350,9 @@ class ImageBot:
         except Exception as e:
             logger.error(f"Ошибка при поиске paste.pics: {str(e)}")
         finally:
-            # Отправка оставшихся медиа
             if key in self.media_groups and self.media_groups[key].get("media"):
                 await self.send_media(update, key, self.media_groups[key]["media"])
             
-            # Финализация сессии
             if key in self.sessions:
                 session = self.sessions[key]
                 elapsed = int(time.time() - session["start_time"])
@@ -1367,12 +1360,6 @@ class ImageBot:
                 found = session.get("found", 0)
                 analyzed = session.get("analyzed", 0)
                 stop_reason = session.get("stop_reason", "")
-                
-                # Логирование завершения
-                if stop_reason == "source_disabled":
-                    logger.info(f"Поиск пользователя {key} остановлен из-за недоступности источника. Время: {format_time(elapsed)}")
-                else:
-                    logger.info(f"Поиск пользователя {key} завершен. Найдено: {found}/{target}. Время: {format_time(elapsed)}")
                 
                 if session.get("stop", False) and found < target:
                     text = f"🔴 Поиск остановлен\n"
@@ -1395,12 +1382,10 @@ class ImageBot:
                 
                 await update.message.reply_text(text)
                 
-                # Очистка
                 self.cleanup_user_session(key)
                 await self.show_main_menu(update)
 
     async def get_freeimage_images(self, update: Update, context: CallbackContext):
-        """Поиск изображений на freeimage"""
         key = self.get_key(update)
         
         if await self.check_cooldown(update):
@@ -1421,7 +1406,6 @@ class ImageBot:
             await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
-        # Проверка активного идентичного поиска
         if key in self.sessions:
             current_session = self.sessions[key]
             if (current_session["source_type"] == "freeimage" and 
@@ -1429,12 +1413,10 @@ class ImageBot:
                 await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
                 return
         
-        # Остановка предыдущего поиска
         if key in self.sessions:
             await self.stop(update, context, silent=True)
             await asyncio.sleep(1)
         
-        # Создание новой сессии
         status_msg = await update.message.reply_text(
             f"🔍 Поиск freeimage начат\n"
             f"Цель: {count} изображений\n"
@@ -1461,15 +1443,11 @@ class ImageBot:
 
         await self.show_main_menu(update)
         
-        # Логирование начала поиска
-        source_name = get_source_name("freeimage")
-        logger.info(f"Поиск пользователя {key} начат. Источник: {source_name}. Цель: {count} изображений")
+        logger.info(f"Поиск пользователя {key} начат. Freeimage. Цель: {count} изображений")
         
-        # Запуск поиска
         asyncio.create_task(self._search_freeimage(update, key, count))
 
     async def _search_freeimage(self, update: Update, key: Tuple[int, int], count: int):
-        """Внутренний метод поиска на freeimage"""
         try:
             session = self.sessions[key]
             session["task"] = asyncio.current_task()
@@ -1484,41 +1462,38 @@ class ImageBot:
                     break
                 
                 code = self.generate_random_string(7)
-                url = f"https://iili.io/{code}.jpg"
                 
                 try:
+                    url = await self.extract_freeimage_url(code)
+                    if not url:
+                        continue
+                        
                     _, ext = await self.check_image(url, "freeimage")
-                    
-                    # Обновление счетчика
+                    if not ext:
+                        continue
+                        
                     session["analyzed"] += 1
                     analyzed = session["analyzed"]
                     
-                    # Обновление статуса
                     if analyzed % UPDATE_ON_CHECKED == 0:
                         await self.update_status_message(key, force=True)
                     
-                    # Регулярное обновление статуса
                     current_time = time.time()
                     if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
                         await self.update_status_message(key)
                         last_update_time = current_time
                     
-                    # Если изображение валидно
-                    if ext:
-                        session["found"] += 1
-                        session["last_found_time"] = time.time()
-                        found = session["found"]
-                        
-                        # Добавление в медиагруппу
-                        await self.add_to_media_group(
-                            update, key, url, ext, count, found, "freeimage"
-                        )
-                        
-                        # Обновление статуса
-                        if found % UPDATE_ON_FOUND == 0:
-                            await self.update_status_message(key, force=True)
+                    session["found"] += 1
+                    session["last_found_time"] = time.time()
+                    found = session["found"]
                     
-                    # Сброс счетчика ошибок
+                    await self.add_to_media_group(
+                        update, key, url, ext, count, found, "freeimage"
+                    )
+                    
+                    if found % UPDATE_ON_FOUND == 0:
+                        await self.update_status_message(key, force=True)
+                    
                     retries = 0
                     await asyncio.sleep(0.1)
                     
@@ -1536,11 +1511,9 @@ class ImageBot:
         except Exception as e:
             logger.error(f"Ошибка при поиске freeimage: {str(e)}")
         finally:
-            # Отправка оставшихся медиа
             if key in self.media_groups and self.media_groups[key].get("media"):
                 await self.send_media(update, key, self.media_groups[key]["media"])
             
-            # Финализация сессии
             if key in self.sessions:
                 session = self.sessions[key]
                 elapsed = int(time.time() - session["start_time"])
@@ -1548,12 +1521,6 @@ class ImageBot:
                 found = session.get("found", 0)
                 analyzed = session.get("analyzed", 0)
                 stop_reason = session.get("stop_reason", "")
-                
-                # Логирование завершения
-                if stop_reason == "source_disabled":
-                    logger.info(f"Поиск пользователя {key} остановлен из-за недоступности источника. Время: {format_time(elapsed)}")
-                else:
-                    logger.info(f"Поиск пользователя {key} завершен. Найдено: {found}/{target}. Время: {format_time(elapsed)}")
                 
                 if session.get("stop", False) and found < target:
                     text = f"🔴 Поиск остановлен\n"
@@ -1576,16 +1543,13 @@ class ImageBot:
                 
                 await update.message.reply_text(text)
                 
-                # Очистка
                 self.cleanup_user_session(key)
                 await self.show_main_menu(update)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик текстовых сообщений"""
         text = update.message.text
         key = self.get_key(update)
 
-        # Проверка кулдауна
         if text not in ["СТОП", "НАЗАД"] and await self.check_cooldown(update):
             return
 
@@ -1701,12 +1665,10 @@ class ImageBot:
             await self.repeat_last_command(update, context)
 
 def shutdown_handler(signum, frame):
-    """Обработчик сигналов завершения работы"""
     logger.info("Получен сигнал остановки")
-    sys.exit(0)  # Непосредственный выход
+    sys.exit(0)
 
 def main():
-    """Основная функция запуска бота"""
     bot = ImageBot()
     try:
         with open("token.txt", "r") as f:
@@ -1722,14 +1684,11 @@ def main():
         logger.error("Токен бота не найден в token.txt")
         return
 
-    # Настройка обработчиков сигналов
-    signal.signal(signal.SIGINT, shutdown_handler)  # Ctrl+C
-    signal.signal(signal.SIGTERM, shutdown_handler)  # Системный сигнал завершения
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
 
-    # Создание и настройка приложения
     application = Application.builder().token(token).build()
 
-    # Добавление обработчиков команд
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("getimg", bot.get_imgur_images))
     application.add_handler(CommandHandler("getprnt", bot.get_prnt_images))
@@ -1743,7 +1702,6 @@ def main():
     logger.info("Бот запущен")
     print("Бот запущен. Нажмите Ctrl+C для остановки")
     
-    # Запуск бота
     try:
         application.run_polling()
     except KeyboardInterrupt:
@@ -1751,7 +1709,6 @@ def main():
     except Exception as e:
         logger.error(f"Ошибка при работе бота: {str(e)}")
     finally:
-        # Принудительное завершение работы
         logger.info("Завершение работы бота")
         sys.exit(0)
 
