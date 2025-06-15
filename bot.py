@@ -1,4 +1,3 @@
-
 import logging
 import random
 import string
@@ -18,7 +17,7 @@ from telegram.ext import (
 from telegram.error import RetryAfter, BadRequest
 from bs4 import BeautifulSoup
 import signal
-import sys  # Добавлен импорт sys
+import sys
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -206,29 +205,47 @@ class ImageBot:
                 text = await response.text()
                 soup = BeautifulSoup(text, "html.parser")
                 
+                # Проверка на отсутствие изображения
                 no_image_div = soup.find('div', class_='no-image')
                 if no_image_div:
                     return None
 
+                # Поиск тега изображения
                 img_tag = soup.find("img", {"class": "screenshot-image"})
                 img_url = None
+                
+                # Извлечение URL из тега изображения
                 if img_tag and "src" in img_tag.attrs:
                     img_url = img_tag["src"]
+                    
+                    # Обработка относительных URL
                     if img_url.startswith("//"):
                         img_url = f"https:{img_url}"
                     elif not img_url.startswith("http"):
                         return None
+                        
+                    # Проверка на placeholder
+                    if "prntscr.com/placeholder" in img_url.lower() or "st.prntscr.com" in img_url.lower():
+                        return None
 
+                # Если не нашли через тег, пробуем через мета-теги
                 if not img_url:
                     meta = soup.find("meta", {"property": "og:image"})
                     if meta and meta.get("content"):
                         img_url = meta["content"]
                         if img_url.startswith("//"):
                             img_url = f"https:{img_url}"
+                        elif not img_url.startswith("http"):
+                            return None
 
+                # Фильтрация невалидных URL
                 if not img_url or "prntscr.com/placeholder" in img_url.lower() or "st.prntscr.com" in img_url.lower():
                     return None
 
+                # Дополнительная проверка, что это прямая ссылка на изображение
+                if "prnt.sc" in img_url:
+                    return None
+                    
                 return img_url
         except Exception as e:
             logger.error(f"Ошибка парсинга prnt.sc: {str(e)}")
