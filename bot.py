@@ -39,7 +39,7 @@ SOURCE_WEIGHTS = {
     'imgur7': 0.2,   # 20% - Imgur с 7-символьными кодами  
     'prnt': 0.2,     # 20% - Prnt.sc
     'pastenow': 0.2, # 20% - Paste.pics
-    'freeimage': 0.3 # 30% - Freeimage
+    'freeimage': 0.3 # 30% - Freeimage (самый высокий приоритет)
 }
 
 # Размеры пакетов для проверки изображений
@@ -173,7 +173,11 @@ class ImgurSource(ImageSource):
             return None
 
 class PrntSource(ImageSource):
-    """Источник изображений Prnt.sc с фильтрацией imgur"""
+    """Источник изображений Prnt.sc"""
+    async def generate_urls(self, batch_size: int) -> List[str]:
+        return [f"https://prnt.sc/{self.bot.generate_random_string(6)}" 
+                for _ in range(batch_size)]
+    
     async def extract_image_url(self, url: str) -> Optional[str]:
         try:
             session = await self.bot.get_session()
@@ -339,6 +343,7 @@ class ImageBot:
         self.sent_image_ids = {}
         self.command_cooldowns = {}
         self.source_errors = {}
+        self.last_status_update = {}  # Время последнего обновления статуса
         
         self.send_semaphore = asyncio.Semaphore(5)
         self.session = None
@@ -659,6 +664,10 @@ class ImageBot:
         # Очистка истории отправленных изображений
         if key in self.sent_image_ids:
             del self.sent_image_ids[key]
+        
+        # Очистка времени обновления статуса
+        if key in self.last_status_update:
+            del self.last_status_update[key]
 
     async def repeat_last_command(self, update: Update, context: CallbackContext):
         """Повтор последней команды пользователя"""
@@ -700,7 +709,12 @@ class ImageBot:
             await self.search_all_sources(update, context)
 
     async def update_status_message(self, key: Tuple[int, int], force: bool = False):
-        """Обновление статусного сообщения"""
+        """Обновление статусного сообщения с троттлингом"""
+        # Проверка минимального интервала между обновлениями (2 секунды)
+        current_time = time.time()
+        if not force and current_time - self.last_status_update.get(key, 0) < 2:
+            return
+            
         session = self.sessions.get(key)
         if not session or not session.get("status_msg"):
             return
@@ -725,11 +739,14 @@ class ImageBot:
                 try:
                     await session["status_msg"].edit_text(text)
                     session["last_status_text"] = text
+                    self.last_status_update[key] = current_time  # Сохраняем время обновления
                 except RetryAfter as e:
-                    logger.warning(f"Flood control при обновлении статуса. Ждем {e.retry_after} сек.")
-                    await asyncio.sleep(e.retry_after)
+                    wait_time = e.retry_after
+                    logger.warning(f"Flood control при обновлении статуса. Ждем {wait_time} сек.")
+                    await asyncio.sleep(wait_time)
                     await session["status_msg"].edit_text(text)
                     session["last_status_text"] = text
+                    self.last_status_update[key] = time.time()
                 except BadRequest as e:
                     if "not modified" not in str(e).lower():
                         logger.error(f"Ошибка при обновлении статуса: {str(e)}")
@@ -756,8 +773,10 @@ class ImageBot:
         try:
             session = self.sessions[key]
             source = self.sources[source_type]
-            last_update_time = time.time()
-            retries = 0
+            last_update_time = time.time()  # Время последнего обновления статуса
+            
+            # Гарантированное начальное обновление
+            await self.update_status_message(key, force=True)
             
             while not session.get("stop", False) and session["found"] < count:
                 # Проверка доступности источника
@@ -767,6 +786,12 @@ class ImageBot:
                     session["stop_reason"] = "source_disabled"
                     break
                 
+                # Проверка интервала времени для обновления статуса
+                current_time = time.time()
+                if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
+                    await self.update_status_message(key)
+                    last_update_time = current_time
+                
                 # Генерация и проверка URL
                 try:
                     urls = await source.generate_urls(BATCH_SIZES[source_type])
@@ -774,9 +799,12 @@ class ImageBot:
                         if session.get("stop", False) or session["found"] >= count:
                             break
                             
-                        # Увеличиваем счетчик проверенных ВСЕГДА
                         session["analyzed"] += 1
                         analyzed = session["analyzed"]
+                        
+                        # Обновление статуса каждые N проверок
+                        if analyzed % UPDATE_ON_CHECKED == 0:
+                            await self.update_status_message(key, force=True)
                         
                         # Извлечение реального URL (для источников с парсингом)
                         img_url = await source.extract_image_url(url)
@@ -788,28 +816,17 @@ class ImageBot:
                         if not final_url or not ext:
                             continue
                             
-                        # Обновление статуса
-                        if analyzed % UPDATE_ON_CHECKED == 0:
-                            await self.update_status_message(key, force=True)
-                        
-                        current_time = time.time()
-                        if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
-                            await self.update_status_message(key)
-                            last_update_time = current_time
-                        
-                        # Найдено валидное изображение
                         session["found"] += 1
-                        session["last_found_time"] = time.time()
                         found = session["found"]
+                        
+                        # Обновление статуса каждые N найденных изображений
+                        if found % UPDATE_ON_FOUND == 0:
+                            await self.update_status_message(key, force=True)
                         
                         # Добавление в медиагруппу
                         await self.add_to_media_group(
                             update, key, final_url, ext, count, found, source_type
                         )
-                        
-                        # Обновление статуса при нахождении
-                        if found % UPDATE_ON_FOUND == 0:
-                            await self.update_status_message(key, force=True)
                     
                     retries = 0
                     await asyncio.sleep(0.1)
@@ -828,6 +845,9 @@ class ImageBot:
         except Exception as e:
             logger.error(f"Ошибка при поиске {source_type}: {str(e)}")
         finally:
+            # Гарантированное обновление статуса перед завершением
+            await self.update_status_message(key, force=True)
+            
             # Отправка оставшихся изображений
             if key in self.media_groups and self.media_groups[key].get("media"):
                 await self.send_media(update, key, self.media_groups[key]["media"])
@@ -861,7 +881,10 @@ class ImageBot:
                         f"Время: {format_time(elapsed)}"
                     )
                 
-                await update.message.reply_text(text)
+                try:
+                    await update.message.reply_text(text)
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке финального сообщения: {str(e)}")
                 
                 self.cleanup_user_session(key)
                 await self.show_main_menu(update)
@@ -936,6 +959,9 @@ class ImageBot:
         await self.show_main_menu(update)
         logger.info(f"Поиск пользователя {key} начат. Все источники. Цель: {count} изображений")
         
+        # Гарантированное начальное обновление
+        await self.update_status_message(key, force=True)
+        
         # Запуск задач для каждого источника
         asyncio.create_task(self._search_all_sources(update, key, count))
 
@@ -947,8 +973,7 @@ class ImageBot:
             batch_size = BATCH_SIZES.get(source_type, 10)
             weight = SOURCE_WEIGHTS.get(source_type, 0.2)
             max_per_source = min(50, max(1, round(weight * count * 1.5)))
-            last_update_time = time.time()
-            retries = 0
+            last_update_time = time.time()  # Время последнего обновления статуса
             
             while not session.get("stop", False):
                 if session["found"] >= count:
@@ -960,6 +985,12 @@ class ImageBot:
                     session["sources"][source_type]["active"] = False
                     break
                 
+                # Проверка интервала времени для обновления статуса
+                current_time = time.time()
+                if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
+                    await self.update_status_message(key)
+                    last_update_time = current_time
+                
                 try:
                     # Генерация URL
                     urls = await source.generate_urls(batch_size)
@@ -968,9 +999,12 @@ class ImageBot:
                         if session.get("stop", False) or session["found"] >= count:
                             break
                             
-                        # Увеличиваем счетчик проверенных ВСЕГДА
                         session["analyzed"] += 1
                         analyzed = session["analyzed"]
+                        
+                        # Обновление статуса каждые N проверок
+                        if analyzed % UPDATE_ON_CHECKED == 0:
+                            await self.update_status_message(key, force=True)
                         
                         # Извлечение реального URL
                         img_url = await source.extract_image_url(url)
@@ -982,29 +1016,18 @@ class ImageBot:
                         if not final_url or not ext:
                             continue
                             
-                        # Обновление статуса
-                        if analyzed % UPDATE_ON_CHECKED == 0:
-                            await self.update_status_message(key, force=True)
-                        
-                        current_time = time.time()
-                        if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
-                            await self.update_status_message(key)
-                            last_update_time = current_time
-                        
-                        # Найдено валидное изображение
                         session["found"] += 1
                         session["sources"][source_type]["found"] += 1
-                        session["last_found_time"] = time.time()
                         found = session["found"]
+                        
+                        # Обновление статуса каждые N найденных изображений
+                        if found % UPDATE_ON_FOUND == 0:
+                            await self.update_status_message(key, force=True)
                         
                         # Добавление в медиагруппу
                         await self.add_to_media_group(
                             update, key, final_url, ext, count, found, source_type
                         )
-                        
-                        # Обновление статуса при нахождении
-                        if found % UPDATE_ON_FOUND == 0:
-                            await self.update_status_message(key, force=True)
                     
                     retries = 0
                     await asyncio.sleep(0.1)
@@ -1035,6 +1058,9 @@ class ImageBot:
         except Exception as e:
             logger.error(f"Ошибка при поиске всех источников: {str(e)}")
         finally:
+            # Гарантированное обновление статуса перед завершением
+            await self.update_status_message(key, force=True)
+            
             # Отправка оставшихся изображений
             if key in self.media_groups and self.media_groups[key].get("media"):
                 await self.send_media(update, key, self.media_groups[key]["media"])
@@ -1076,7 +1102,7 @@ class ImageBot:
                 self.cleanup_user_session(key)
                 await self.show_main_menu(update)
 
-    # Обработчики для конкретных источников используют общую логику _generic_search
+    # Обработчики для конкретных источников
     async def get_imgur_images(self, update: Update, context: CallbackContext):
         """Поиск изображений на Imgur"""
         key = self.get_key(update)
@@ -1104,6 +1130,9 @@ class ImageBot:
             await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
             return
 
+        # Определение типа источника
+        source_type = f"imgur{length}"
+        
         # Проверка активного идентичного поиска
         if key in self.sessions:
             current_session = self.sessions[key]
@@ -1117,9 +1146,6 @@ class ImageBot:
         if key in self.sessions:
             await self.stop(update, context, silent=True)
             await asyncio.sleep(1)
-        
-        # Определение типа источника
-        source_type = f"imgur{length}"
         
         # Создание статусного сообщения
         status_msg = await update.message.reply_text(
@@ -1155,8 +1181,6 @@ class ImageBot:
         # Запуск поиска
         asyncio.create_task(self._generic_search(update, key, source_type, count))
 
-    # Аналогичные обработчики для других источников (prnt, pastenow, freeimage)
-    # Они отличаются только source_type и параметрами
     async def get_prnt_images(self, update: Update, context: CallbackContext):
         key = self.get_key(update)
         if await self.check_cooldown(update): return
