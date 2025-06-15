@@ -170,6 +170,8 @@ class ImgurSource(ImageSource):
             return url
         except Exception as e:
             logger.error(f"Imgur check error: {str(e)}")
+            source_name = f'imgur{self.length}'
+            await self.bot.handle_source_error(source_name, str(e))
             return None
 
 class PrntSource(ImageSource):
@@ -204,18 +206,14 @@ class PrntSource(ImageSource):
             img_tag = soup.find("img", {"class": "screenshot-image"})
             if img_tag and img_tag.get("src"):
                 img_url = img_tag["src"]
-                # Фильтрация URL от imgur
-                if "imgur.com" in img_url:
+                # Убрана фильтрация imgur
+                if any(x in img_url.lower() for x in ["placeholder", "st.prntscr.com"]):
                     return None
             else:
                 meta_image = soup.find("meta", property="og:image")
                 if meta_image and meta_image.get("content"):
                     img_url = meta_image["content"]
-                    # Фильтрация URL от imgur
-                    if "imgur.com" in img_url:
-                        return None
 
-            # Если URL не найден или не прошел фильтрацию
             if not img_url:
                 return None
                 
@@ -225,21 +223,18 @@ class PrntSource(ImageSource):
             elif not img_url.startswith("http"):
                 return None
                 
-            # Дополнительная фильтрация плохих URL
-            if any(x in img_url.lower() for x in ["placeholder", "st.prntscr.com"]):
+            # Фильтрация плохих URL
+            if any(x in img_url.lower() for x in ["prnt.sc/placeholder", "st.prntscr.com"]):
                 return None
                 
             if "removed.png" in img_url.lower():
-                return None
-                
-            # Проверка, что URL принадлежит prnt.sc
-            if "prntscr.com" not in img_url and "prnt.sc" not in img_url:
                 return None
                 
             return img_url
             
         except Exception as e:
             logger.error(f"Prnt.sc parsing error: {str(e)}")
+            await self.bot.handle_source_error('prnt', str(e))
             return None
 
 class PasteNowSource(ImageSource):
@@ -290,6 +285,7 @@ class PasteNowSource(ImageSource):
             
         except Exception as e:
             logger.error(f"PasteNow parsing error: {str(e)}")
+            await self.bot.handle_source_error('pastenow', str(e))
             return None
 
 class FreeImageSource(ImageSource):
@@ -319,6 +315,7 @@ class FreeImageSource(ImageSource):
             return url
         except Exception as e:
             logger.error(f"FreeImage check error: {str(e)}")
+            await self.bot.handle_source_error('freeimage', str(e))
             return None
 
 class ImageBot:
@@ -342,12 +339,24 @@ class ImageBot:
         self.media_groups = {}
         self.sent_image_ids = {}
         self.command_cooldowns = {}
-        self.source_errors = {}
+        self.source_errors = {}  # Словарь для отслеживания ошибок источников
         self.last_status_update = {}  # Время последнего обновления статуса
         
         self.send_semaphore = asyncio.Semaphore(5)
         self.session = None
         self._session_initialized = False
+
+    def is_source_disabled(self, source: str) -> bool:
+        """Проверяет, отключен ли источник из-за ошибок"""
+        if source in self.source_errors:
+            return (time.time() - self.source_errors[source]) < SOURCE_TIMEOUT
+        return False
+
+    async def handle_source_error(self, source: str, message: str):
+        """Блокирует источник при ошибках"""
+        logger.error(f"Ошибка источника {source}: {message}")
+        self.source_errors[source] = time.time()
+        return source
 
     async def get_session(self):
         """Возвращает сессию aiohttp, создавая при необходимости"""
@@ -623,6 +632,8 @@ class ImageBot:
             message = f"🔴 Поиск остановлен\n"
             if stop_reason == "source_disabled":
                 message += "⚠️ Источник временно недоступен\n"
+            elif stop_reason == "all_sources_disabled":
+                message += "⚠️ Все источники временно недоступны\n"
             message += (
                 f"Цель: {target} изображений\n"
                 f"Найдено: {found}/{target}\n"
@@ -755,18 +766,6 @@ class ImageBot:
         except Exception as e:
             logger.error(f"Ошибка при подготовке статуса: {str(e)}")
 
-    def is_source_disabled(self, source: str) -> bool:
-        """Проверяет, отключен ли источник из-за ошибок"""
-        if source in self.source_errors:
-            return (time.time() - self.source_errors[source]) < SOURCE_TIMEOUT
-        return False
-
-    async def handle_source_error(self, source: str, message: str):
-        """Обрабатывает ошибку источника"""
-        logger.error(f"Ошибка источника {source}: {message}")
-        self.source_errors[source] = time.time()
-        return source
-
     async def _generic_search(self, update: Update, key: Tuple[int, int], 
                             source_type: str, count: int, length: int = None):
         """Общая логика поиска для всех источников"""
@@ -775,6 +774,13 @@ class ImageBot:
             source = self.sources[source_type]
             last_update_time = time.time()  # Время последнего обновления статуса
             
+            # Проверка блокировки источника
+            if self.is_source_disabled(source_type):
+                logger.info(f"Источник {source_type} временно отключен")
+                session["stop"] = True
+                session["stop_reason"] = "source_disabled"
+                return
+                
             # Гарантированное начальное обновление
             await self.update_status_message(key, force=True)
             
@@ -833,11 +839,11 @@ class ImageBot:
                     
                 except Exception as e:
                     logger.error(f"Ошибка при поиске в {source_type}: {str(e)}")
+                    await self.handle_source_error(source_type, str(e))
                     retries += 1
                     if retries >= MAX_RETRIES:
                         session["stop"] = True
                         session["stop_reason"] = "error"
-                        await self.handle_source_error(source_type, str(e))
                     await asyncio.sleep(0.5)
             
         except asyncio.CancelledError:
@@ -883,219 +889,6 @@ class ImageBot:
                 
                 try:
                     await update.message.reply_text(text)
-                except Exception as e:
-                    logger.error(f"Ошибка при отправке финального сообщения: {str(e)}")
-                
-                self.cleanup_user_session(key)
-                await self.show_main_menu(update)
-
-    async def search_all_sources(self, update: Update, context: CallbackContext):
-        """Поиск по всем источникам одновременно"""
-        key = self.get_key(update)
-        
-        if await self.check_cooldown(update):
-            return
-            
-        args = context.args
-        if len(args) != 1:
-            await update.message.reply_text("Используйте: /getall <1-50>")
-            return
-
-        try:
-            count = int(args[0])
-        except ValueError:
-            await update.message.reply_text("Количество должно быть числом")
-            return
-
-        if not 1 <= count <= 50:
-            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
-            return
-
-        # Проверка активного идентичного поиска
-        if key in self.sessions:
-            current_session = self.sessions[key]
-            if current_session["source_type"] == "all" and current_session["target_count"] == count:
-                await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
-                return
-        
-        # Остановка текущего поиска
-        if key in self.sessions:
-            await self.stop(update, context, silent=True)
-            await asyncio.sleep(1)
-        
-        # Создание статусного сообщения
-        status_msg = await update.message.reply_text(
-            f"🔍 Поиск всех источников начат\n"
-            f"Цель: {count} изображений\n"
-            f"Найдено: 0/{count}\n"
-            f"Проверено: 0\n"
-            f"Время: 0с"
-        )
-        
-        # Инициализация сессии
-        session_data = {
-            "tasks": [],
-            "stop": False,
-            "start_time": time.time(),
-            "last_update": time.time(),
-            "last_found_time": time.time(),
-            "status_msg": status_msg,
-            "target_count": count,
-            "found": 0,
-            "analyzed": 0,
-            "source_type": "all",
-            "sources": {
-                "imgur5": {"active": True, "found": 0},
-                "imgur7": {"active": True, "found": 0},
-                "prnt": {"active": True, "found": 0},
-                "pastenow": {"active": True, "found": 0},
-                "freeimage": {"active": True, "found": 0}
-            }
-        }
-        self.sessions[key] = session_data
-        self.last_commands[key] = {"type": "all", "count": count}
-        self.command_cooldowns[key] = time.time()
-
-        await self.show_main_menu(update)
-        logger.info(f"Поиск пользователя {key} начат. Все источники. Цель: {count} изображений")
-        
-        # Гарантированное начальное обновление
-        await self.update_status_message(key, force=True)
-        
-        # Запуск задач для каждого источника
-        asyncio.create_task(self._search_all_sources(update, key, count))
-
-    async def _search_all_sources(self, update: Update, key: Tuple[int, int], count: int):
-        """Асинхронный поиск по всем источникам"""
-        async def search_source(source_type: str):
-            nonlocal session
-            source = self.sources[source_type]
-            batch_size = BATCH_SIZES.get(source_type, 10)
-            weight = SOURCE_WEIGHTS.get(source_type, 0.2)
-            max_per_source = min(50, max(1, round(weight * count * 1.5)))
-            last_update_time = time.time()  # Время последнего обновления статуса
-            
-            while not session.get("stop", False):
-                if session["found"] >= count:
-                    break
-                if session["sources"][source_type]["found"] >= max_per_source:
-                    break
-                if self.is_source_disabled(source_type):
-                    logger.info(f"Источник {source_type} временно отключен")
-                    session["sources"][source_type]["active"] = False
-                    break
-                
-                # Проверка интервала времени для обновления статуса
-                current_time = time.time()
-                if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
-                    await self.update_status_message(key)
-                    last_update_time = current_time
-                
-                try:
-                    # Генерация URL
-                    urls = await source.generate_urls(batch_size)
-                    
-                    for url in urls:
-                        if session.get("stop", False) or session["found"] >= count:
-                            break
-                            
-                        session["analyzed"] += 1
-                        analyzed = session["analyzed"]
-                        
-                        # Обновление статуса каждые N проверок
-                        if analyzed % UPDATE_ON_CHECKED == 0:
-                            await self.update_status_message(key, force=True)
-                        
-                        # Извлечение реального URL
-                        img_url = await source.extract_image_url(url)
-                        if not img_url:
-                            continue
-                            
-                        # Проверка изображения
-                        final_url, ext = await source.check_image(img_url)
-                        if not final_url or not ext:
-                            continue
-                            
-                        session["found"] += 1
-                        session["sources"][source_type]["found"] += 1
-                        found = session["found"]
-                        
-                        # Обновление статуса каждые N найденных изображений
-                        if found % UPDATE_ON_FOUND == 0:
-                            await self.update_status_message(key, force=True)
-                        
-                        # Добавление в медиагруппу
-                        await self.add_to_media_group(
-                            update, key, final_url, ext, count, found, source_type
-                        )
-                    
-                    retries = 0
-                    await asyncio.sleep(0.1)
-                    
-                except Exception as e:
-                    logger.error(f"Ошибка при поиске в {source_type}: {str(e)}")
-                    retries += 1
-                    if retries >= MAX_RETRIES:
-                        session["sources"][source_type]["active"] = False
-                        await self.handle_source_error(source_type, str(e))
-                        break
-                    await asyncio.sleep(1)
-        
-        try:
-            session = self.sessions[key]
-            
-            # Запуск задач для каждого активного источника
-            tasks = []
-            for source_type in SOURCE_WEIGHTS.keys():
-                if not self.is_source_disabled(source_type):
-                    tasks.append(asyncio.create_task(search_source(source_type)))
-            
-            session["tasks"] = tasks
-            await asyncio.gather(*tasks)
-            
-        except asyncio.CancelledError:
-            logger.info(f"Поиск всех источников для {key} отменен")
-        except Exception as e:
-            logger.error(f"Ошибка при поиске всех источников: {str(e)}")
-        finally:
-            # Гарантированное обновление статуса перед завершением
-            await self.update_status_message(key, force=True)
-            
-            # Отправка оставшихся изображений
-            if key in self.media_groups and self.media_groups[key].get("media"):
-                await self.send_media(update, key, self.media_groups[key]["media"])
-            
-            if key in self.sessions:
-                session = self.sessions[key]
-                elapsed = int(time.time() - session["start_time"])
-                target = session["target_count"]
-                found = session.get("found", 0)
-                analyzed = session.get("analyzed", 0)
-                stop_reason = session.get("stop_reason", "")
-                
-                # Формирование итогового сообщения
-                if stop_reason == "source_disabled":
-                    logger.info(f"Поиск пользователя {key} остановлен из-за недоступности источника. Время: {format_time(elapsed)}")
-                    message = (
-                        f"🔴 Поиск остановлен\n"
-                        f"⚠️ Один или несколько источников временно недоступны\n"
-                        f"Цель: {target} изображений\n"
-                        f"Найдено: {found}/{target}\n"
-                        f"Проверено: {analyzed}\n"
-                        f"Время: {format_time(elapsed)}"
-                    )
-                else:
-                    logger.info(f"Поиск пользователя {key} завершен. Найдено: {found}/{target}. Время: {format_time(elapsed)}")
-                    message = (
-                        f"✅ Поиск завершен\n"
-                        f"Цель: {target} изображений\n"
-                        f"Найдено: {found}/{target}\n"
-                        f"Проверено: {analyzed}\n"
-                        f"Время: {format_time(elapsed)}"
-                    )
-                
-                try:
-                    await update.message.reply_text(message)
                 except Exception as e:
                     logger.error(f"Ошибка при отправке финального сообщения: {str(e)}")
                 
@@ -1366,6 +1159,237 @@ class ImageBot:
         
         # Запуск поиска
         asyncio.create_task(self._generic_search(update, key, "freeimage", count))
+
+    async def search_all_sources(self, update: Update, context: CallbackContext):
+        """Поиск по всем источникам одновременно"""
+        key = self.get_key(update)
+        
+        if await self.check_cooldown(update):
+            return
+            
+        args = context.args
+        if len(args) != 1:
+            await update.message.reply_text("Используйте: /getall <1-50>")
+            return
+
+        try:
+            count = int(args[0])
+        except ValueError:
+            await update.message.reply_text("Количество должно быть числом")
+            return
+
+        if not 1 <= count <= 50:
+            await update.message.reply_text("Можно запросить от 1 до 50 изображений за раз")
+            return
+
+        # Проверка активного идентичного поиска
+        if key in self.sessions:
+            current_session = self.sessions[key]
+            if current_session["source_type"] == "all" and current_session["target_count"] == count:
+                await update.message.reply_text("❗️ Идентичный поиск уже выполняется.")
+                return
+        
+        # Остановка текущего поиска
+        if key in self.sessions:
+            await self.stop(update, context, silent=True)
+            await asyncio.sleep(1)
+        
+        # Создание статусного сообщения
+        status_msg = await update.message.reply_text(
+            f"🔍 Поиск всех источников начат\n"
+            f"Цель: {count} изображений\n"
+            f"Найдено: 0/{count}\n"
+            f"Проверено: 0\n"
+            f"Время: 0с"
+        )
+        
+        # Инициализация сессии
+        session_data = {
+            "tasks": [],
+            "stop": False,
+            "start_time": time.time(),
+            "last_update": time.time(),
+            "last_found_time": time.time(),
+            "status_msg": status_msg,
+            "target_count": count,
+            "found": 0,
+            "analyzed": 0,
+            "source_type": "all",
+            "sources": {
+                "imgur5": {"active": True, "found": 0},
+                "imgur7": {"active": True, "found": 0},
+                "prnt": {"active": True, "found": 0},
+                "pastenow": {"active": True, "found": 0},
+                "freeimage": {"active": True, "found": 0}
+            }
+        }
+        self.sessions[key] = session_data
+        self.last_commands[key] = {"type": "all", "count": count}
+        self.command_cooldowns[key] = time.time()
+
+        await self.show_main_menu(update)
+        logger.info(f"Поиск пользователя {key} начат. Все источники. Цель: {count} изображений")
+        
+        # Гарантированное начальное обновление
+        await self.update_status_message(key, force=True)
+        
+        # Запуск задач для каждого источника
+        asyncio.create_task(self._search_all_sources(update, key, count))
+
+    async def _search_all_sources(self, update: Update, key: Tuple[int, int], count: int):
+        """Асинхронный поиск по всем источникам"""
+        async def search_source(source_type: str):
+            nonlocal session
+            source = self.sources[source_type]
+            batch_size = BATCH_SIZES.get(source_type, 10)
+            weight = SOURCE_WEIGHTS.get(source_type, 0.2)
+            max_per_source = min(50, max(1, round(weight * count * 1.5)))
+            last_update_time = time.time()  # Время последнего обновления статуса
+            
+            while not session.get("stop", False):
+                if session["found"] >= count:
+                    break
+                if session["sources"][source_type]["found"] >= max_per_source:
+                    break
+                if self.is_source_disabled(source_type):
+                    logger.info(f"Источник {source_type} временно отключен")
+                    session["sources"][source_type]["active"] = False
+                    break
+                
+                # Проверка интервала времени для обновления статуса
+                current_time = time.time()
+                if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
+                    await self.update_status_message(key)
+                    last_update_time = current_time
+                
+                try:
+                    # Генерация URL
+                    urls = await source.generate_urls(batch_size)
+                    
+                    for url in urls:
+                        if session.get("stop", False) or session["found"] >= count:
+                            break
+                            
+                        session["analyzed"] += 1
+                        analyzed = session["analyzed"]
+                        
+                        # Обновление статуса каждые N проверок
+                        if analyzed % UPDATE_ON_CHECKED == 0:
+                            await self.update_status_message(key, force=True)
+                        
+                        # Извлечение реального URL
+                        img_url = await source.extract_image_url(url)
+                        if not img_url:
+                            continue
+                            
+                        # Проверка изображения
+                        final_url, ext = await source.check_image(img_url)
+                        if not final_url or not ext:
+                            continue
+                            
+                        session["found"] += 1
+                        session["sources"][source_type]["found"] += 1
+                        found = session["found"]
+                        
+                        # Обновление статуса каждые N найденных изображений
+                        if found % UPDATE_ON_FOUND == 0:
+                            await self.update_status_message(key, force=True)
+                        
+                        # Добавление в медиагруппу
+                        await self.add_to_media_group(
+                            update, key, final_url, ext, count, found, source_type
+                        )
+                    
+                    retries = 0
+                    await asyncio.sleep(0.1)
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка при поиске в {source_type}: {str(e)}")
+                    await self.handle_source_error(source_type, str(e))
+                    retries += 1
+                    if retries >= MAX_RETRIES:
+                        session["sources"][source_type]["active"] = False
+                        break
+                    await asyncio.sleep(1)
+        
+        try:
+            session = self.sessions[key]
+            
+            # Запуск задач для каждого активного источника
+            tasks = []
+            for source_type in SOURCE_WEIGHTS.keys():
+                if not self.is_source_disabled(source_type):
+                    tasks.append(asyncio.create_task(search_source(source_type)))
+                else:
+                    logger.info(f"Источник {source_type} отключен, пропускаем")
+            
+            # Проверка доступных источников
+            if not tasks:
+                logger.error("Все источники отключены. Поиск невозможен.")
+                session["stop"] = True
+                session["stop_reason"] = "all_sources_disabled"
+                return
+                
+            session["tasks"] = tasks
+            await asyncio.gather(*tasks)
+            
+        except asyncio.CancelledError:
+            logger.info(f"Поиск всех источников для {key} отменен")
+        except Exception as e:
+            logger.error(f"Ошибка при поиске всех источников: {str(e)}")
+        finally:
+            # Гарантированное обновление статуса перед завершением
+            await self.update_status_message(key, force=True)
+            
+            # Отправка оставшихся изображений
+            if key in self.media_groups and self.media_groups[key].get("media"):
+                await self.send_media(update, key, self.media_groups[key]["media"])
+            
+            if key in self.sessions:
+                session = self.sessions[key]
+                elapsed = int(time.time() - session["start_time"])
+                target = session["target_count"]
+                found = session.get("found", 0)
+                analyzed = session.get("analyzed", 0)
+                stop_reason = session.get("stop_reason", "")
+                
+                # Формирование итогового сообщения
+                if stop_reason == "source_disabled":
+                    logger.info(f"Поиск пользователя {key} остановлен из-за недоступности источника. Время: {format_time(elapsed)}")
+                    message = (
+                        f"🔴 Поиск остановлен\n"
+                        f"⚠️ Один или несколько источников временно недоступны\n"
+                        f"Цель: {target} изображений\n"
+                        f"Найдено: {found}/{target}\n"
+                        f"Проверено: {analyzed}\n"
+                        f"Время: {format_time(elapsed)}"
+                    )
+                elif stop_reason == "all_sources_disabled":
+                    message = (
+                        f"🔴 Поиск остановлен\n"
+                        f"⚠️ Все источники временно недоступны\n"
+                        f"Цель: {target} изображений\n"
+                        f"Найдено: {found}/{target}\n"
+                        f"Проверено: {analyzed}\n"
+                        f"Время: {format_time(elapsed)}"
+                    )
+                else:
+                    logger.info(f"Поиск пользователя {key} завершен. Найдено: {found}/{target}. Время: {format_time(elapsed)}")
+                    message = (
+                        f"✅ Поиск завершен\n"
+                        f"Цель: {target} изображений\n"
+                        f"Найдено: {found}/{target}\n"
+                        f"Проверено: {analyzed}\n"
+                        f"Время: {format_time(elapsed)}"
+                    )
+                
+                try:
+                    await update.message.reply_text(message)
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке финального сообщения: {str(e)}")
+                
+                self.cleanup_user_session(key)
+                await self.show_main_menu(update)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений (кнопок)"""
