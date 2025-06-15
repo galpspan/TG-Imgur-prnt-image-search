@@ -1,4 +1,4 @@
-# Telegram Image Search Bot 🤖🖼️ (Обновлено)
+# Telegram Image Search Bot 🤖🖼️
 
 Бот для поиска случайных изображений с Imgur, Prnt.sc, Paste.pics и Freeimage. Находит рабочие ссылки на картинки, проверяет их доступность и отправляет изображения в Telegram-чат.
 
