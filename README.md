@@ -4,7 +4,7 @@
 
 ## 📌 Источник вдохновения
 
-Часть идей была взята у [VladislavMilev/prnt.sc_parser](https://github.com/VladislavMilev/prnt.sc_parser).
+Часть идей была взята у [VladislavMilev/prnt.sc_parser](https://github.com/VladislavMilev/prnt.sc_parser), [JustEnotik/PrntSCParser](https://github.com/JustEnotik/PrntSCParser), [medwuu/prnt.sc-parser](https://github.com/medwuu/prnt.sc-parser).
 
 ---
 
