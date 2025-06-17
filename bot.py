@@ -40,8 +40,8 @@ SOURCE_WEIGHTS = {
     'imgur7': 0.2,     # 20% - Imgur с 7-символьными кодами 
     'prnt': 0.1,       # 20% - Prnt.sc
     'pastenow': 0.2,   # 20% - Paste.pics
-    'freeimage': 0.2,  # 30% - Freeimage
-    'kappa': 0.2       # 10% - Kappa.lol
+    'freeimage': 0.2,  # 20% - Freeimage
+    'kappa': 0.2       # 20% - Kappa.lol
 }
 
 BATCH_SIZES = {
