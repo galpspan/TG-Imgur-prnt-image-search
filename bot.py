@@ -1797,26 +1797,39 @@ class ImageBot:
 
     async def _search_all_sources(self, update: Update, key: Tuple[int, int], count: int):
         async def search_source(source_type: str):
-            nonlocal session
+            nonlocal session, total_active_weight
             user_info_str = session.get("user_info", "System")
             source = self.sources[source_type]
             batch_size = BATCH_SIZES.get(source_type, 10)
-            weight = SOURCE_WEIGHTS.get(source_type, 0.2)
-            max_per_source = min(50, max(1, round(weight * count * 1.5)))
             last_update_time = time.time()
             retries = 0
             
+            # Рассчитываем динамическую квоту для источника
+            weight = SOURCE_WEIGHTS.get(source_type, 0.2)
+            max_per_source = min(50, max(1, round(weight * count * 1.5)))
+            
             while not session.get("stop", False):
+                # Пересчитываем квоту при каждом обновлении
                 if session["found"] >= count:
                     break
-                if session["sources"][source_type]["found"] >= max_per_source:
-                    break
-                
+                    
                 # Проверяем блокировку источника перед каждой итерацией
                 if self.is_source_disabled(source_type):
                     logger.info(f"Источник {source_type} временно отключен", extra={'user_info': user_info_str})
                     session["sources"][source_type]["active"] = False
                     session["sources"][source_type]["status"] = "отключен"
+                    break
+                
+                # Обновляем динамическую квоту
+                if total_active_weight > 0:
+                    weight_factor = weight / total_active_weight
+                    remaining = count - session["found"]
+                    max_per_source = min(50, max(1, round(weight_factor * remaining * 1.2)))
+                
+                if session["sources"][source_type]["found"] >= max_per_source:
+                    logger.info(f"Источник {source_type} достиг квоты ({max_per_source})", extra={'user_info': user_info_str})
+                    session["sources"][source_type]["active"] = False
+                    session["sources"][source_type]["status"] = "квота"
                     break
                 
                 current_time = time.time()
@@ -1831,7 +1844,7 @@ class ImageBot:
                     retries += 1
                     if retries >= MAX_RETRIES:
                         session["sources"][source_type]["active"] = False
-                        session["sources"][source_type]["status"] = "отключен"
+                        session["sources"][source_type]["status"] = "ошибка"
                         break
                     await asyncio.sleep(1)
                     continue
@@ -1883,7 +1896,7 @@ class ImageBot:
                         retries += 1
                         if retries >= MAX_RETRIES:
                             session["sources"][source_type]["active"] = False
-                            session["sources"][source_type]["status"] = "отключен"
+                            session["sources"][source_type]["status"] = "ошибка"
                             break
                         continue
                 
@@ -1894,22 +1907,30 @@ class ImageBot:
             session = self.sessions[key]
             user_info_str = session.get("user_info", "System")
             
-            tasks = []
+            # Рассчитываем активные источники и общий вес
+            active_sources = []
+            total_active_weight = 0.0
+            
             for source_type in SOURCE_WEIGHTS.keys():
-                # Пропускаем заблокированные источники
                 if not self.is_source_disabled(source_type):
+                    weight = SOURCE_WEIGHTS[source_type]
+                    active_sources.append(source_type)
+                    total_active_weight += weight
                     session["sources"][source_type]["status"] = "активен"
-                    tasks.append(asyncio.create_task(search_source(source_type)))
                 else:
                     logger.info(f"Источник {source_type} отключен, пропускаем", extra={'user_info': user_info_str})
                     session["sources"][source_type]["status"] = "отключен"
             
-            if not tasks:
+            if not active_sources:
                 logger.error("Все источники отключены. Поиск невозможен.", extra={'user_info': user_info_str})
                 session["stop"] = True
                 session["stop_reason"] = "all_sources_disabled"
                 return
                 
+            tasks = []
+            for source_type in active_sources:
+                tasks.append(asyncio.create_task(search_source(source_type)))
+            
             session["tasks"] = tasks
             await asyncio.gather(*tasks)
             
@@ -2122,7 +2143,51 @@ class ImageBot:
         elif text == "ПОВТОРИТЬ":
             await self.repeat_last_command(update, context)
 
+# ============== ИСПРАВЛЕНИЯ В ФУНКЦИИ cleanup ==============
+async def cleanup(self):
+    """Асинхронная очистка ресурсов с обработкой ошибок"""
+    try:
+        # Закрываем aiohttp сессию
+        if self.session and not self.session.closed:
+            try:
+                await self.session.close()
+            except RuntimeError as e:
+                if "Event loop is closed" not in str(e):
+                    logger.error(f"Ошибка при закрытии сессии: {str(e)}")
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии сессии: {str(e)}")
+        
+        # Останавливаем все активные сессии пользователей
+        for key in list(self.sessions.keys()):
+            try:
+                await self.stop_session(key, "shutdown")
+            except Exception as e:
+                logger.error(f"Ошибка при остановке сессии пользователя: {str(e)}")
+        
+    except RuntimeError as e:
+        if "Event loop is closed" in str(e):
+            logger.info("Event loop закрыт, пропускаем асинхронную очистку")
+        else:
+            logger.error(f"RuntimeError при очистке: {str(e)}")
+    except Exception as e:
+        logger.error(f"Критическая ошибка при очистке: {str(e)}")
+    finally:
+        # Очищаем все структуры данных
+        self.media_groups.clear()
+        self.sent_image_ids.clear()
+        self.command_cooldowns.clear()
+        self.source_errors.clear()
+        self.last_status_update.clear()
+        self.dns_error_count.clear()
+        self.last_dns_error_log.clear()
+        self.sessions.clear()
+
+# ============== ИСПРАВЛЕНИЯ В ФУНКЦИИ main ==============
 def main():
+    # Устанавливаем политику event loop для Windows
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     bot = ImageBot()
     try:
         with open("token.txt", "r") as f:
@@ -2165,10 +2230,9 @@ def main():
     finally:
         logger.info("Завершение работы бота")
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            # Создаем новый event loop для очистки
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             loop.run_until_complete(bot.cleanup())
         except RuntimeError as e:
             if "Event loop is closed" in str(e):
@@ -2177,6 +2241,12 @@ def main():
                 logger.error(f"Ошибка при очистке: {str(e)}")
         except Exception as e:
             logger.error(f"Неожиданная ошибка при очистке: {str(e)}")
+        finally:
+            # Явно закрываем event loop
+            try:
+                loop.close()
+            except:
+                pass
 
 if __name__ == "__main__":
     main()
