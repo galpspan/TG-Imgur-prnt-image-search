@@ -24,14 +24,12 @@ from PIL import Image
 import mimetypes
 
 # ======================= НАСТРОЙКИ ЛОГИРОВАНИЯ =======================
-# Фильтр для добавления user_info во все записи лога
 class UserInfoFilter(logging.Filter):
     def filter(self, record):
         if not hasattr(record, 'user_info'):
             record.user_info = "System"
         return True
 
-# Настройка корневого логгера
 root_logger = logging.getLogger()
 for handler in root_logger.handlers[:]:
     root_logger.removeHandler(handler)
@@ -54,7 +52,6 @@ root_logger.addHandler(file_handler)
 root_logger.addHandler(stream_handler)
 root_logger.setLevel(logging.INFO)
 
-# Установим уровень для библиотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
@@ -64,56 +61,43 @@ logger = logging.getLogger(__name__)
 
 # ======================= КОНФИГУРАЦИЯ БОТА ===========================
 SOURCE_WEIGHTS = {
-    'imgur5': 0.1,     # 10% - Imgur с 5-символьными кодами
-    'imgur7': 0.2,     # 20% - Imgur с 7-символьными кодами 
-    'prnt': 0.1,       # 20% - Prnt.sc
-    'pastenow': 0.2,   # 20% - Paste.pics
-    'freeimage': 0.2,  # 20% - Freeimage
-    'kappa': 0.2       # 20% - Kappa.lol
+    'imgur5': 0.1,
+    'imgur7': 0.2,
+    'prnt': 0.1,
+    'pastenow': 0.2,
+    'freeimage': 0.2,
+    'kappa': 0.2
 }
 
 BATCH_SIZES = {
-    'imgur5': 5,      # 5 URL за раз для Imgur5
-    'imgur7': 10,     # 10 URL за раз для Imgur7
-    'prnt': 10,       # 10 кодов за раз для Prnt.sc
-    'pastenow': 10,   # 10 кодов за раз для Paste.pics
-    'freeimage': 10,  # 10 URL за раз для Freeimage
-    'kappa': 10       # 10 URL за раз для Kappa.lol
+    'imgur5': 5,
+    'imgur7': 10,
+    'prnt': 10,
+    'pastenow': 10,
+    'freeimage': 10,
+    'kappa': 10
 }
 
-# Время блокировки источника после ошибки (в секундах)
-SOURCE_TIMEOUT = 600  # 10 минут
-DNS_ERROR_TIMEOUT = 1800  # 30 минут для DNS ошибок
+SOURCE_TIMEOUT = 600
+DNS_ERROR_TIMEOUT = 1800
 
-# Настройки группировки медиа при отправке
-MAX_GROUP_SIZE = 10    # Макс. количество изображений в одном сообщении
-GROUP_TIMEOUT = 60     # 1 минута - ждем наполнения группы перед отправкой
+MAX_GROUP_SIZE = 10
+GROUP_TIMEOUT = 60
 
-# Настройки обновления статуса
-STATUS_UPDATE_INTERVAL = 10  # Обновлять статус каждые 10 секунд
-UPDATE_ON_FOUND = 5          # Обновлять статус каждые 5 найденных изображений
-UPDATE_ON_CHECKED = 50       # Обновлять статус каждые 50 проверенных URL
+STATUS_UPDATE_INTERVAL = 10
+UPDATE_ON_FOUND = 5
+UPDATE_ON_CHECKED = 50
 
-# Таймауты и ограничения
-MEDIA_SEND_TIMEOUT = 60           # 60 сек на отправку медиа в Telegram
-MAX_CONCURRENT_TASKS = 30         # Макс. одновременных задач проверки URL
-MAX_RETRIES = 3                   # Макс. попыток при ошибках
-COOLDOWN_DURATION = 5             # 5 секунд кулдауна между командами
-REQUEST_TIMEOUT = 15              # 15 сек таймаут HTTP-запросов
-MAX_FILE_SIZE = 49 * 1024 * 1024  # 49 МБ - максимальный размер для Telegram
-LARGE_FILE_IMAGE = "file50mb.png" # Путь к картинке-заглушке
-MIN_WIDTH = 30                    # Минимальная ширина изображения
-MIN_HEIGHT = 30                   # Минимальная высота изображения
+MEDIA_SEND_TIMEOUT = 60
+MAX_CONCURRENT_TASKS = 30
+MAX_RETRIES = 3
+COOLDOWN_DURATION = 5
+REQUEST_TIMEOUT = 15
+MAX_FILE_SIZE = 49 * 1024 * 1024
+LARGE_FILE_IMAGE = "file50mb.png"
+MIN_WIDTH = 30
+MIN_HEIGHT = 30
 
-# Типы ошибок при отправке фото
-PHOTO_SEND_ERRORS = [
-    "webpage_curl_failed",
-    "Wrong type of the web page content",
-    "Failed to get http url content",
-    "Photo_invalid_dimensions"
-]
-
-# Сигнатуры файлов для определения типа
 FILE_SIGNATURES = {
     b'\xFF\xD8\xFF': 'jpg',
     b'\x89PNG\r\n\x1a\n': 'png',
@@ -127,14 +111,14 @@ FILE_SIGNATURES = {
     b'7z\xBC\xAF\x27\x1C': '7z',
     b'\x25\x50\x44\x46': 'pdf',
     b'\x50\x4B\x03\x04': 'docx',
-    b'\xD0\xCF\x11\xE0': 'doc',  # MS Office
-    b'\x49\x44\x33': 'mp3',      # ID3 MP3
-    b'\xFF\xFB': 'mp3',          # MPEG layer 3
+    b'\xD0\xCF\x11\xE0': 'doc',
+    b'\x49\x44\x33': 'mp3',
+    b'\xFF\xFB': 'mp3',
     b'\xFF\xF3': 'mp3',
     b'\xFF\xF2': 'mp3',
     b'fLaC': 'flac',
     b'OggS': 'ogg',
-    b'\x1A\x45\xDF\xA3': 'webm', # Matroska/WebM
+    b'\x1A\x45\xDF\xA3': 'webm',
     b'\x52\x49\x46\x46....\x57\x45\x42\x50': 'webp',
     b'\x52\x49\x46\x46....\x41\x56\x49\x20': 'avi',
     b'\x00\x00\x00 ftyp': 'mp4',
@@ -142,9 +126,7 @@ FILE_SIGNATURES = {
     b'\x00\x00\x00\x20ftyp': 'mp4',
 }
 
-# Кастомные исключения
 class IncompleteDownloadError(Exception):
-    """Исключение для неполных загрузок"""
     pass
 # ======================================================================
 
@@ -187,39 +169,24 @@ class ImageSource:
         return url
     
     async def get_actual_extension(self, data: bytes, url: str) -> str:
-        """Определяет реальное расширение файла по его содержимому"""
-        # Проверяем известные форматы
         image_type = imghdr.what(None, h=data)
         if image_type:
             return image_type if image_type != 'jpeg' else 'jpg'
         
-        # Проверяем по сигнатурам
         for signature, ext in FILE_SIGNATURES.items():
             if data.startswith(signature):
                 return ext
         
-        # Если не удалось определить, берем из URL
         return mimetypes.guess_extension(mimetypes.types_map.get(url.split('.')[-1].lower(), '')) or 'bin'
     
-    async def check_image_size(self, data: bytes) -> Tuple[int, int]:
-        """Определяет размер изображения"""
-        try:
-            img = Image.open(BytesIO(data))
-            return img.size
-        except Exception as e:
-            logger.error(f"Ошибка определения размеров изображения: {str(e)}")
-        return (0, 0)
-    
     async def download_and_verify(self, url: str, user_info: str) -> Tuple[Optional[str], Optional[str], Optional[bytes]]:
-        """Скачивает файл с проверкой целостности"""
         for attempt in range(MAX_RETRIES):
             try:
                 session = await self.bot.get_session()
                 headers = {"User-Agent": random.choice(self.bot.user_agents)}
                 
-                # Увеличиваем таймаут для iili.io
                 timeout_settings = aiohttp.ClientTimeout(
-                    total=60 if "iili.io" in url else 15,  # Увеличен до 60 секунд
+                    total=60 if "iili.io" in url else 15,
                     sock_connect=20,
                     sock_read=60 if "iili.io" in url else 15
                 )
@@ -228,7 +195,6 @@ class ImageSource:
                     if response.status != 200:
                         return None, None, None
                     
-                    # Проверяем размер файла
                     file_size = 0
                     content_length = response.headers.get('Content-Length')
                     if content_length:
@@ -240,56 +206,50 @@ class ImageSource:
                     if file_size > MAX_FILE_SIZE:
                         return url, 'too_big', None
                     
-                    # Скачиваем файл частями с контролем размера
                     downloaded = 0
                     chunks = []
-                    async for chunk in response.content.iter_chunked(1024*512):  # 512KB блоки
+                    async for chunk in response.content.iter_chunked(1024*512):
                         if not chunk:
                             raise IncompleteDownloadError("Получен пустой чанк")
                         chunks.append(chunk)
                         downloaded += len(chunk)
                         
-                        # Проверка на превышение максимального размера
                         if downloaded > MAX_FILE_SIZE:
                             logger.warning(f"Файл превысил лимит во время скачивания: {url}", extra={'user_info': user_info})
                             return url, 'too_big', None
                     
                     data = b''.join(chunks)
                     
-                    # Проверяем соответствие размера
                     if content_length and downloaded != int(content_length):
                         raise IncompleteDownloadError(
                             f"Ожидалось {content_length} байт, получено {downloaded}"
                         )
                     
-                    # Проверяем что данные не пустые
                     if not data:
                         raise IncompleteDownloadError("Получены пустые данные")
                     
-                    # Дополнительная проверка целостности изображений
+                    # Проверка размеров изображения
                     try:
                         img = Image.open(BytesIO(data))
-                        img.verify()  # Проверка целостности
-                    except Exception as e:
-                        raise IncompleteDownloadError(f"Проверка изображения не удалась: {str(e)}")
-                    
-                    # Определяем реальное расширение
-                    extension = await self.get_actual_extension(data, url)
-                    
-                    # Проверяем размеры изображения
-                    if extension in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']:
-                        width, height = await self.check_image_size(data)
+                        width, height = img.size
+                        
+                        # Отсеиваем слишком маленькие изображения
                         if width < MIN_WIDTH or height < MIN_HEIGHT:
                             logger.info(f"Изображение слишком маленькое: {width}x{height} < {MIN_WIDTH}x{MIN_HEIGHT}", extra={'user_info': user_info})
                             return None, None, None
+                        
+                        img.verify()
+                    except Exception as e:
+                        raise IncompleteDownloadError(f"Проверка изображения не удалась: {str(e)}")
                     
+                    extension = await self.get_actual_extension(data, url)
                     return url, extension, data
             
             except IncompleteDownloadError as e:
                 logger.error(f"Неполная загрузка (попытка {attempt+1}/{MAX_RETRIES}): {url} - {str(e)}", extra={'user_info': user_info})
                 if attempt == MAX_RETRIES - 1:
                     return None, None, None
-                await asyncio.sleep(1)  # Задержка перед повторной попыткой
+                await asyncio.sleep(1)
                 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f"Сетевая ошибка (попытка {attempt+1}/{MAX_RETRIES}): {url} - {str(e)}", extra={'user_info': user_info})
@@ -307,10 +267,8 @@ class ImageSource:
     
     
     async def check_image(self, url: str, user_info: str) -> Tuple[Optional[str], Optional[str]]:
-        """Проверяет изображение с несколькими попытками"""
         for attempt in range(MAX_RETRIES):
             try:
-                # Сначала пробуем HEAD запрос для быстрой проверки
                 session = await self.bot.get_session()
                 headers = {"User-Agent": random.choice(self.bot.user_agents)}
                 
@@ -329,7 +287,6 @@ class ImageSource:
                     if any(x in final_url.lower() for x in ["removed", "deleted", "error"]):
                         return None, None
                 
-                # Если HEAD успешен, делаем полную загрузку
                 img_url, extension, _ = await self.download_and_verify(final_url, user_info)
                 if not img_url or not extension:
                     continue
@@ -358,7 +315,6 @@ class KappaLolSource(ImageSource):
             session = await self.bot.get_session()
             headers = {"User-Agent": random.choice(self.bot.user_agents)}
             
-            # Увеличиваем таймаут для DNS-запросов
             timeout = aiohttp.ClientTimeout(total=30, sock_connect=15)
             
             async with session.head(url, headers=headers, 
@@ -369,7 +325,6 @@ class KappaLolSource(ImageSource):
                     return None, None
                     
                 if response.status != 200:
-                    # Логируем HTTP ошибки как обычные ошибки источника
                     await self.bot.handle_source_error('kappa', 
                         Exception(f"HTTP status {response.status}"), url, user_info)
                     return None, None
@@ -382,7 +337,6 @@ class KappaLolSource(ImageSource):
                 
                 final_url = str(response.url)
                 
-                # Проверяем размер файла
                 file_size = 0
                 content_length = response.headers.get('Content-Length')
                 if content_length:
@@ -391,21 +345,18 @@ class KappaLolSource(ImageSource):
                     except (TypeError, ValueError):
                         pass
                 
-                # Если файл слишком большой
                 if file_size > MAX_FILE_SIZE:
                     logger.info(f"[KAPPA] Файл слишком большой ({file_size//1024//1024}MB): {final_url}", extra={'user_info': user_info})
                     return final_url, 'too_big'
                 
-                # Скачиваем и проверяем изображение
+                # Используем download_and_verify для проверки размеров
                 img_url, extension, _ = await self.download_and_verify(final_url, user_info)
                 if not img_url or not extension:
                     return None, None
                 
-                # Для изображений уже выполнена проверка размеров
                 if 'image' in content_type:
                     return img_url, extension
                 
-                # Для других типов контента
                 if 'gif' in content_type:
                     return final_url, 'gif'
                 elif 'mp4' in content_type or 'webm' in content_type:
@@ -419,12 +370,10 @@ class KappaLolSource(ImageSource):
                     return final_url, 'file'
                     
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-            # Специальная обработка для ошибок сети
             logger.debug(f"Сетевая ошибка Kappa: {type(e).__name__}", extra={'user_info': user_info})
             await self.bot.handle_source_error('kappa', e, url, user_info)
             return None, None
         except Exception as e:
-            # Обработка всех остальных ошибок
             logger.error(f"Неизвестная ошибка в Kappa: {str(e)}", extra={'user_info': user_info})
             await self.bot.handle_source_error('kappa', e, url, user_info)
             return None, None
@@ -491,7 +440,6 @@ class PrntSource(ImageSource):
                 img_tag = soup.find("img", {"class": "screenshot-image"})
                 if img_tag and img_tag.get("src"):
                     img_url = img_tag["src"]
-                    # Обновленная проверка на плейсхолдер
                     if any(x in img_url.lower() for x in ["placeholder", "st.prntscr.com"]):
                         return None
                 else:
@@ -507,7 +455,6 @@ class PrntSource(ImageSource):
                 elif not img_url.startswith("http"):
                     return None
                     
-                # Дополнительная проверка на плейсхолдер
                 if any(x in img_url.lower() for x in ["prnt.sc/placeholder", "st.prntscr.com", "prntscr.com/placeholder"]):
                     return None
                     
@@ -630,47 +577,38 @@ class ImageBot:
         self._session_initialized = False
 
     def is_source_disabled(self, source: str) -> bool:
-        """Проверяет временную блокировку источника с разными таймаутами"""
         if source in self.source_errors:
             error_time = self.source_errors[source]
             
-            # Определяем время блокировки в зависимости от типа ошибки
             if "NameResolutionError" in str(self.source_errors.get(source, "")):
                 timeout = DNS_ERROR_TIMEOUT
             else:
                 timeout = SOURCE_TIMEOUT
             
-            # Автоматически снимаем блокировку по истечении времени
             if time.time() - error_time < timeout:
                 return True
             else:
-                del self.source_errors[source]  # Разблокируем источник
+                del self.source_errors[source]
         return False
 
     async def handle_source_error(self, source: str, error: Exception, url: Optional[str] = None, user_info: str = "System"):
-        """Блокирует источник при ошибках с группировкой сообщений"""
-        # Определяем тип ошибки
         error_type = type(error).__name__
         error_str = str(error)
         
-        # Группируем ошибки DNS
         if "NameResolutionError" in error_type or "getaddrinfo failed" in error_str:
             current_time = time.time()
             
-            # Проверяем, нужно ли логировать эту ошибку
             if source in self.last_dns_error_log:
                 last_log_time = self.last_dns_error_log[source]
-                if current_time - last_log_time < 60:  # 1 минута кэширования
+                if current_time - last_log_time < 60:
                     return
                 
-            # Логируем и обновляем время последнего логирования
             logger.error(f"🚨 КРИТИЧЕСКАЯ ОШИБКА DNS: {source} - {error_str}", extra={'user_info': user_info})
             logger.warning(f"🔒 Источник {source} заблокирован на {DNS_ERROR_TIMEOUT//60} минут из-за ошибки DNS", extra={'user_info': user_info})
             self.last_dns_error_log[source] = current_time
             self.source_errors[source] = current_time
             return
         
-        # Для обычных ошибок
         error_msg = f"Ошибка источника {source}"
         if url:
             error_msg += f" (URL: {url})"
@@ -691,9 +629,7 @@ class ImageBot:
         return self.session
 
     async def cleanup(self):
-        """Асинхронная очистка ресурсов с обработкой ошибок"""
         try:
-            # Закрываем aiohttp сессию
             if self.session and not self.session.closed:
                 try:
                     await self.session.close()
@@ -703,7 +639,6 @@ class ImageBot:
                 except Exception as e:
                     logger.error(f"Ошибка при закрытии сессии: {str(e)}")
             
-            # Останавливаем все активные сессии пользователей
             for key in list(self.sessions.keys()):
                 try:
                     await self.stop_session(key, "shutdown")
@@ -718,7 +653,6 @@ class ImageBot:
         except Exception as e:
             logger.error(f"Критическая ошибка при очистке: {str(e)}")
         finally:
-            # Очищаем все структуры данных
             self.media_groups.clear()
             self.sent_image_ids.clear()
             self.command_cooldowns.clear()
@@ -741,7 +675,7 @@ class ImageBot:
         elif "iili.io" in url:
             return url.split("/")[-1].split(".")[0]
         elif "zov.gachi.gay" in url:
-            return url.split("/")[-1].split("?")[0]  # Удаляем query-параметры
+            return url.split("/")[-1].split("?")[0]
         return url.split("/")[-1][:10]
 
     async def check_cooldown(self, update: Update) -> bool:
@@ -763,7 +697,6 @@ class ImageBot:
     async def add_to_media_group(self, update: Update, key: Tuple[int, int], 
                                url: str, ext: str, count: int, found: int, source: str):
         try:
-            # Получаем информацию о пользователе из сессии
             user_info = self.sessions.get(key, {}).get("user_info", "System")
             
             image_id = self.extract_image_id(url)
@@ -778,14 +711,12 @@ class ImageBot:
             
             self.sent_image_ids[key].add(image_id)
             
-            # Обработка слишком больших файлов (>49MB)
             if ext == "too_big":
                 logger.info(f"[{source.upper()}] Файл слишком большой: {url}", extra={'user_info': user_info})
                 caption = f"⚠️ Файл слишком большой для Telegram (максимум 50 МБ)\n{caption}"
                 await self.send_large_file_image(update, key, caption, image_id)
                 return
             
-            # Обработка документов
             if ext in ['document', 'file', 'audio', 'flac', 'mp3']:
                 logger.info(f"[{source.upper()}] Отправка документа: {url}", extra={'user_info': user_info})
                 await self.send_document(update, key, url, caption)
@@ -830,10 +761,8 @@ class ImageBot:
             logger.error(f"Ошибка в add_to_media_group: {str(e)}", extra={'user_info': user_info})
 
     async def send_large_file_image(self, update: Update, key: Tuple[int, int], caption: str, url: str):
-        """Отправляет картинку-заглушку для слишком больших файлов"""
         if not os.path.exists(LARGE_FILE_IMAGE):
             logger.error(f"Файл заглушки не найден: {LARGE_FILE_IMAGE}")
-            # Если картинка не найдена, отправляем текстовое сообщение
             await update.message.reply_text(caption, parse_mode="Markdown")
             return
             
@@ -867,7 +796,6 @@ class ImageBot:
                 await update.message.reply_text(caption, parse_mode="Markdown")
 
     async def send_document(self, update: Update, key: Tuple[int, int], url: str, caption: str):
-        """Отправляет документ как отдельное сообщение"""
         async with self.send_semaphore:
             try:
                 await update.message.reply_document(
@@ -891,7 +819,6 @@ class ImageBot:
             except BadRequest as e:
                 if "File is too big" in str(e):
                     logger.warning(f"Файл слишком большой: {url}")
-                    # Отправляем картинку-заглушку
                     caption = f"⚠️ Файл слишком большой для Telegram (максимум 50 МБ)\n{caption}"
                     await self.send_large_file_image(update, key, caption, url)
                 elif "Wrong file identifier" in str(e):
@@ -905,7 +832,6 @@ class ImageBot:
         if not media_group:
             return
             
-        # Получаем информацию о пользователе из сессии
         user_info = self.sessions.get(key, {}).get("user_info", "System")
         
         async with self.send_semaphore:
@@ -954,7 +880,7 @@ class ImageBot:
                                 logger.info(f"Успешно отправлено фото #{sent_count}", extra={'user_info': user_info})
                             except BadRequest as e:
                                 error_msg = str(e)
-                                if any(err in error_msg for err in PHOTO_SEND_ERRORS):
+                                if any(err in error_msg for err in ["webpage_curl_failed", "Wrong type of the web page content", "Failed to get http url content", "Photo_invalid_dimensions"]):
                                     logger.error(f"Ошибка отправки фото {photo.media}: {error_msg}. Отправляю как документ.", extra={'user_info': user_info})
                                     await self.send_document(update, key, photo.media, photo.caption)
                                     sent_count += 1
@@ -991,7 +917,6 @@ class ImageBot:
                     except Exception as e:
                         logger.error(f"Ошибка отправки видео {video.media}: {str(e)}", extra={'user_info': user_info})
                 
-                # Логируем результат отправки
                 total_media = len(media_group)
                 if sent_count < total_media:
                     logger.warning(f"Отправлено {sent_count}/{total_media} медиа из группы", extra={'user_info': user_info})
@@ -1069,11 +994,9 @@ class ImageBot:
 
 ⚠️ Важно!
 
-Бот собирает контент из открытых источников и не хранит его. Мы не контролируем содержание и не можем его изменить.
+В некоторых источниках могут встречаться неприятные, шокирующие или NSFW-материалы. Используйте бота на свой страх и риск.
 
-Если встретили шокирующий, NSFW или незаконный материал — пропустите его. Претензии — только к первоисточнику.
-
-Используйте на свой страх и риск.
+Если вам попался нежелательный контент – просто пропустите его. Будьте осторожны!
 """
         )
 
@@ -1101,7 +1024,6 @@ class ImageBot:
             logger.info("Отправка оставшихся медиа в группе...")
             await self.send_media(update, key, media_group)
         
-        # Собираем статистику перед удалением сессии
         stats_text = ""
         if session["source_type"] == "all":
             stats_lines = []
@@ -1130,14 +1052,13 @@ class ImageBot:
                 f"Найдено: {found}/{target}\n"
                 f"Проверено: {analyzed}\n"
                 f"Время: {format_time(elapsed)}"
-                f"{stats_text}"  # Добавляем статистику здесь
+                f"{stats_text}"
             )
             
             await update.message.reply_text(message)
             await self.show_main_menu(update)
 
     async def stop_session(self, key: Tuple[int, int], reason: str = "user"):
-        """Безопасная остановка сессии с обработкой асинхронных задач"""
         session = self.sessions.get(key)
         if not session:
             return
@@ -1145,18 +1066,15 @@ class ImageBot:
         session["stop"] = True
         session["stop_reason"] = reason
         
-        # Отменяем все связанные задачи
         if "tasks" in session:
             for task in session["tasks"]:
                 if not task.done():
                     try:
                         task.cancel()
-                        # Даем задаче шанс корректно завершиться
                         await asyncio.sleep(0.1)
                     except Exception as e:
                         logger.error(f"Ошибка при отмене задачи: {str(e)}")
         
-        # Удаляем сессию из структур данных
         if key in self.sessions:
             del self.sessions[key]
         if key in self.media_groups:
@@ -1274,7 +1192,6 @@ class ImageBot:
             last_update_time = time.time()
             retries = 0
             
-            # Проверка блокировки источника
             if self.is_source_disabled(source_type):
                 logger.info(f"Источник {source_type} временно отключен", extra={'user_info': user_info_str})
                 session["stop"] = True
@@ -1286,7 +1203,6 @@ class ImageBot:
             await self.update_status_message(key, force=True)
             
             while not session.get("stop", False) and session["found"] < count:
-                # Проверяем блокировку источника в начале каждой итерации
                 if self.is_source_disabled(source_type):
                     logger.info(f"Источник {source_type} временно отключен", extra={'user_info': user_info_str})
                     session["stop"] = True
@@ -1326,10 +1242,9 @@ class ImageBot:
                         if not img_url:
                             continue
                             
-                        # Для iili.io делаем две попытки проверки
                         if "iili.io" in img_url:
                             final_url, ext = None, None
-                            for _ in range(2):  # Дополнительная попытка для iili.io
+                            for _ in range(2):
                                 final_url, ext = await source.check_image(img_url, user_info_str)
                                 if final_url and ext:
                                     break
@@ -1359,7 +1274,7 @@ class ImageBot:
                             break
                         continue
                 
-                retries = 0  # Сброс счетчика после успешного batch
+                retries = 0
                 await asyncio.sleep(0.1)
             
         except asyncio.CancelledError:
@@ -1404,7 +1319,6 @@ class ImageBot:
                 except Exception:
                     pass
                 
-                # Логируем результаты поиска
                 if stop_reason == "source_disabled":
                     status = "отключен"
                 elif session.get("stop", False) and found < target:
@@ -1777,12 +1691,12 @@ class ImageBot:
             "analyzed": 0,
             "source_type": "all",
             "sources": {
-                "imgur5": {"active": True, "found": 0},
-                "imgur7": {"active": True, "found": 0},
-                "prnt": {"active": True, "found": 0},
-                "pastenow": {"active": True, "found": 0},
-                "freeimage": {"active": True, "found": 0},
-                "kappa": {"active": True, "found": 0}
+                "imgur5": {"active": True, "found": 0, "status": "активен"},
+                "imgur7": {"active": True, "found": 0, "status": "активен"},
+                "prnt": {"active": True, "found": 0, "status": "активен"},
+                "pastenow": {"active": True, "found": 0, "status": "активен"},
+                "freeimage": {"active": True, "found": 0, "status": "активен"},
+                "kappa": {"active": True, "found": 0, "status": "активен"}
             },
             "user_info": user_info(update)
         }
@@ -1799,62 +1713,98 @@ class ImageBot:
 
     async def _search_all_sources(self, update: Update, key: Tuple[int, int], count: int):
         async def search_source(source_type: str):
-            nonlocal session, total_active_weight
+            nonlocal session
             user_info_str = session.get("user_info", "System")
             source = self.sources[source_type]
             batch_size = BATCH_SIZES.get(source_type, 10)
             last_update_time = time.time()
             retries = 0
             
-            # Рассчитываем динамическую квоту для источника
-            weight = SOURCE_WEIGHTS.get(source_type, 0.2)
-            max_per_source = min(50, max(1, round(weight * count * 1.5)))
+            # Для Imgur7 резервируем минимальную квоту в 10%
+            min_quota = 0
+            if source_type == 'imgur7':
+                min_quota = max(1, int(count * 0.1))
             
-            while not session.get("stop", False):
-                # Пересчитываем квоту при каждом обновлении
-                if session["found"] >= count:
-                    break
-                    
-                # Проверяем блокировку источника перед каждой итерацией
+            while not session.get("stop", False) and session["found"] < count:
+                # Проверка блокировки источника
                 if self.is_source_disabled(source_type):
                     logger.info(f"Источник {source_type} временно отключен", extra={'user_info': user_info_str})
                     session["sources"][source_type]["active"] = False
                     session["sources"][source_type]["status"] = "отключен"
                     break
                 
-                # Обновляем динамическую квоту
-                if total_active_weight > 0:
-                    weight_factor = weight / total_active_weight
-                    remaining = count - session["found"]
-                    max_per_source = min(50, max(1, round(weight_factor * remaining * 1.2)))
-                
-                if session["sources"][source_type]["found"] >= max_per_source:
-                    logger.info(f"Источник {source_type} достиг квоты ({max_per_source})", extra={'user_info': user_info_str})
-                    session["sources"][source_type]["active"] = False
-                    session["sources"][source_type]["status"] = "квота"
+                # Расчет динамической квоты с перераспределением
+                remaining_total = count - session["found"]
+                if remaining_total <= 0:
                     break
                 
+                # Собираем активные источники
+                active_sources = []
+                for src in SOURCE_WEIGHTS:
+                    if session["sources"][src]["active"] and not self.is_source_disabled(src):
+                        # Проверяем, не достиг ли источник лимита
+                        weight = SOURCE_WEIGHTS[src]
+                        max_for_source = int(count * weight * 1.5)
+                        if session["sources"][src]["found"] >= max_for_source:
+                            session["sources"][src]["status"] = "квота"
+                            session["sources"][src]["active"] = False
+                        else:
+                            active_sources.append(src)
+                
+                # Если нет активных источников - выходим
+                if not active_sources:
+                    logger.info(f"Нет активных источников. Выход из задачи для {source_type}.", extra={'user_info': user_info_str})
+                    break
+                
+                # Для Imgur7 гарантируем минимальную квоту
+                if source_type == 'imgur7':
+                    remaining_quota = min_quota - session["sources"][source_type]["found"]
+                    if remaining_quota <= 0:
+                        session["sources"][source_type]["status"] = "квота"
+                        session["sources"][source_type]["active"] = False
+                        break
+                
+                # Рассчет квоты для текущего источника
+                if source_type == 'imgur7' and min_quota > 0:
+                    # Для Imgur7 используем зарезервированную квоту
+                    max_for_this_source = min_quota
+                    remaining_this = max(0, max_for_this_source - session["sources"][source_type]["found"])
+                else:
+                    # Для остальных - равное распределение оставшейся квоты
+                    max_for_this_source = min(50, int(remaining_total / len(active_sources) * 1.2))
+                    remaining_this = max_for_this_source - session["sources"][source_type]["found"]
+                
+                # Если квота исчерпана - отмечаем и выходим
+                if remaining_this <= 0:
+                    session["sources"][source_type]["status"] = "квота"
+                    session["sources"][source_type]["active"] = False
+                    break
+                
+                # Обновление статуса
                 current_time = time.time()
                 if current_time - last_update_time >= STATUS_UPDATE_INTERVAL:
                     await self.update_status_message(key)
                     last_update_time = current_time
                 
+                # Генерация URL с учетом квоты
+                current_batch_size = min(batch_size, remaining_this, remaining_total)
                 try:
-                    urls = await source.generate_urls(batch_size)
+                    urls = await source.generate_urls(current_batch_size)
                 except Exception as e:
                     await self.bot.handle_source_error(source_type, e, None, user_info_str)
                     retries += 1
                     if retries >= MAX_RETRIES:
                         session["sources"][source_type]["active"] = False
-                        session["sources"][source_type]["status"] = "ошибка"
+                        session["sources"][source_type]["status"] = "отключен"
                         break
                     await asyncio.sleep(1)
                     continue
                 
+                # Обработка URL
                 for url in urls:
                     if session.get("stop", False) or session["found"] >= count:
                         break
-                    if session["sources"][source_type]["found"] >= max_per_source:
+                    if session["sources"][source_type]["found"] >= max_for_this_source:
                         break
                     
                     try:
@@ -1867,21 +1817,21 @@ class ImageBot:
                         img_url = await source.extract_image_url(url)
                         if not img_url:
                             continue
-                            
-                        # Для iili.io делаем две попытки проверки
+                        
+                        # Проверка изображения
                         if "iili.io" in img_url:
                             final_url, ext = None, None
-                            for _ in range(2):  # Дополнительная попытка для iili.io
+                            for _ in range(2):
                                 final_url, ext = await source.check_image(img_url, user_info_str)
                                 if final_url and ext:
                                     break
                                 await asyncio.sleep(0.5)
                         else:
                             final_url, ext = await source.check_image(img_url, user_info_str)
-                            
+                        
                         if not final_url or not ext:
                             continue
-                            
+                        
                         session["found"] += 1
                         session["sources"][source_type]["found"] += 1
                         found = session["found"]
@@ -1898,41 +1848,31 @@ class ImageBot:
                         retries += 1
                         if retries >= MAX_RETRIES:
                             session["sources"][source_type]["active"] = False
-                            session["sources"][source_type]["status"] = "ошибка"
+                            session["sources"][source_type]["status"] = "отключен"
                             break
                         continue
                 
-                retries = 0  # Сброс счетчика после успешного batch
+                retries = 0
                 await asyncio.sleep(0.1)
         
         try:
             session = self.sessions[key]
             user_info_str = session.get("user_info", "System")
             
-            # Рассчитываем активные источники и общий вес
-            active_sources = []
-            total_active_weight = 0.0
-            
+            tasks = []
             for source_type in SOURCE_WEIGHTS.keys():
                 if not self.is_source_disabled(source_type):
-                    weight = SOURCE_WEIGHTS[source_type]
-                    active_sources.append(source_type)
-                    total_active_weight += weight
-                    session["sources"][source_type]["status"] = "активен"
+                    tasks.append(asyncio.create_task(search_source(source_type)))
                 else:
                     logger.info(f"Источник {source_type} отключен, пропускаем", extra={'user_info': user_info_str})
                     session["sources"][source_type]["status"] = "отключен"
             
-            if not active_sources:
+            if not tasks:
                 logger.error("Все источники отключены. Поиск невозможен.", extra={'user_info': user_info_str})
                 session["stop"] = True
                 session["stop_reason"] = "all_sources_disabled"
                 return
                 
-            tasks = []
-            for source_type in active_sources:
-                tasks.append(asyncio.create_task(search_source(source_type)))
-            
             session["tasks"] = tasks
             await asyncio.gather(*tasks)
             
@@ -1954,7 +1894,6 @@ class ImageBot:
                 analyzed = session.get("analyzed", 0)
                 stop_reason = session.get("stop_reason", "")
                 
-                # Собираем подробную статистику по источникам
                 stats_lines = []
                 for src, data in session.get("sources", {}).items():
                     src_name = get_source_name(src)
@@ -1999,7 +1938,6 @@ class ImageBot:
                 except Exception:
                     pass
                 
-                # Логируем результаты поиска
                 logger.info(
                     f"Поиск завершен. Цель: {target}, найдено: {found}, "
                     f"проверено: {analyzed}, время: {format_time(elapsed)}\n"
@@ -2102,7 +2040,7 @@ class ImageBot:
             reply_keyboard = [
                 ["1", "3", "5"],
                 ["10", "15", "25"],
-                ["50", "НАЗАД"],
+                ["50", "НАЗАд"],
             ]
             await update.message.reply_text(
                 f"IMGUR - Выбрана длина {text}. Теперь выберите количество:",
@@ -2145,51 +2083,7 @@ class ImageBot:
         elif text == "ПОВТОРИТЬ":
             await self.repeat_last_command(update, context)
 
-# ============== ИСПРАВЛЕНИЯ В ФУНКЦИИ cleanup ==============
-async def cleanup(self):
-    """Асинхронная очистка ресурсов с обработкой ошибок"""
-    try:
-        # Закрываем aiohttp сессию
-        if self.session and not self.session.closed:
-            try:
-                await self.session.close()
-            except RuntimeError as e:
-                if "Event loop is closed" not in str(e):
-                    logger.error(f"Ошибка при закрытии сессии: {str(e)}")
-            except Exception as e:
-                logger.error(f"Ошибка при закрытии сессии: {str(e)}")
-        
-        # Останавливаем все активные сессии пользователей
-        for key in list(self.sessions.keys()):
-            try:
-                await self.stop_session(key, "shutdown")
-            except Exception as e:
-                logger.error(f"Ошибка при остановке сессии пользователя: {str(e)}")
-        
-    except RuntimeError as e:
-        if "Event loop is closed" in str(e):
-            logger.info("Event loop закрыт, пропускаем асинхронную очистку")
-        else:
-            logger.error(f"RuntimeError при очистке: {str(e)}")
-    except Exception as e:
-        logger.error(f"Критическая ошибка при очистке: {str(e)}")
-    finally:
-        # Очищаем все структуры данных
-        self.media_groups.clear()
-        self.sent_image_ids.clear()
-        self.command_cooldowns.clear()
-        self.source_errors.clear()
-        self.last_status_update.clear()
-        self.dns_error_count.clear()
-        self.last_dns_error_log.clear()
-        self.sessions.clear()
-
-# ============== ИСПРАВЛЕНИЯ В ФУНКЦИИ main ==============
 def main():
-    # Устанавливаем политику event loop для Windows
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
     bot = ImageBot()
     try:
         with open("token.txt", "r") as f:
@@ -2205,10 +2099,8 @@ def main():
         logger.error("Токен бота не найден в token.txt")
         return
 
-    # Создаем Application
     application = Application.builder().token(token).build()
 
-    # Добавляем обработчики
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("getimg", bot.get_imgur_images))
     application.add_handler(CommandHandler("getprnt", bot.get_prnt_images))
@@ -2232,9 +2124,10 @@ def main():
     finally:
         logger.info("Завершение работы бота")
         try:
-            # Создаем новый event loop для очистки
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             loop.run_until_complete(bot.cleanup())
         except RuntimeError as e:
             if "Event loop is closed" in str(e):
@@ -2243,12 +2136,6 @@ def main():
                 logger.error(f"Ошибка при очистке: {str(e)}")
         except Exception as e:
             logger.error(f"Неожиданная ошибка при очистке: {str(e)}")
-        finally:
-            # Явно закрываем event loop
-            try:
-                loop.close()
-            except:
-                pass
 
 if __name__ == "__main__":
     main()
