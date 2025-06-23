@@ -60,6 +60,10 @@ logger = logging.getLogger(__name__)
 # ======================================================================
 
 # ======================= КОНФИГУРАЦИЯ БОТА ===========================
+# Приоритет источников: от высокого к низкому
+SOURCE_PRIORITY = ['imgur5', 'freeimage', 'kappa', 'pastenow', 'prnt', 'imgur7']
+
+# Сбалансированные квоты
 SOURCE_WEIGHTS = {
     'imgur5': 0.1,
     'imgur7': 0.2,
@@ -70,8 +74,8 @@ SOURCE_WEIGHTS = {
 }
 
 BATCH_SIZES = {
-    'imgur5': 5,
-    'imgur7': 10,
+    'imgur5': 10,
+    'imgur7': 5,
     'prnt': 10,
     'pastenow': 10,
     'freeimage': 10,
@@ -91,7 +95,7 @@ UPDATE_ON_CHECKED = 50
 MEDIA_SEND_TIMEOUT = 60
 MAX_CONCURRENT_TASKS = 30
 MAX_RETRIES = 3
-COOLDOWN_DURATION = 5
+COOLDOWN_DURATION = 180
 REQUEST_TIMEOUT = 15
 MAX_FILE_SIZE = 49 * 1024 * 1024
 LARGE_FILE_IMAGE = "file50mb.png"
@@ -612,7 +616,11 @@ class ImageBot:
         error_type = type(error).__name__
         error_str = str(error)
         
-        if "NameResolutionError" in error_type or "getaddrinfo failed" in error_str or "gaierror" in error_str:
+        # Расширенная обработка DNS-ошибок
+        if ("NameResolutionError" in error_type or 
+            "getaddrinfo failed" in error_str or 
+            "gaierror" in error_str or 
+            "DNS failure" in error_str):
             current_time = time.time()
             
             if source in self.last_dns_error_log:
@@ -697,6 +705,15 @@ class ImageBot:
         chars = string.ascii_lowercase + string.digits
         return "".join(random.choices(chars, k=length))
 
+    async def send_as_text(self, update: Update, url: str, caption: str, user_info: str):
+        try:
+            # Отправляем текст с ссылкой
+            text = f"{caption}\nСсылка: {url}" if caption else f"Ссылка: {url}"
+            await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=False)
+            logger.info(f"Отправлено текстовое сообщение со ссылкой: {url}", extra={'user_info': user_info})
+        except Exception as e:
+            logger.error(f"Ошибка при отправке текстовой ссылки: {str(e)}", extra={'user_info': user_info})
+
     async def add_to_media_group(self, update: Update, key: Tuple[int, int], 
                                url: str, ext: str, count: int, found: int, source: str):
         try:
@@ -761,8 +778,10 @@ class ImageBot:
             pass
 
     async def send_large_file_image(self, update: Update, key: Tuple[int, int], caption: str, url: str):
+        user_info = self.sessions.get(key, {}).get("user_info", "System")
+        
         if not os.path.exists(LARGE_FILE_IMAGE):
-            await update.message.reply_text(caption, parse_mode="Markdown")
+            await self.send_as_text(update, url, caption, user_info)
             return
             
         async with self.send_semaphore:
@@ -787,11 +806,13 @@ class ImageBot:
                         connect_timeout=MEDIA_SEND_TIMEOUT
                     )
             except BadRequest as e:
-                await update.message.reply_text(caption, parse_mode="Markdown")
+                await self.send_as_text(update, url, caption, user_info)
             except Exception as e:
-                await update.message.reply_text(caption, parse_mode="Markdown")
+                await self.send_as_text(update, url, caption, user_info)
 
     async def send_document(self, update: Update, key: Tuple[int, int], url: str, caption: str):
+        user_info = self.sessions.get(key, {}).get("user_info", "System")
+        
         async with self.send_semaphore:
             try:
                 await update.message.reply_document(
@@ -812,11 +833,19 @@ class ImageBot:
                     connect_timeout=MEDIA_SEND_TIMEOUT
                 )
             except BadRequest as e:
-                if "File is too big" in str(e):
+                error_msg = str(e)
+                if "File is too big" in error_msg:
                     caption = f"⚠️ Файл слишком большой для Telegram (максимум 50 МБ)\n{caption}"
                     await self.send_large_file_image(update, key, caption, url)
-            except Exception:
-                pass
+                elif "Wrong type of the web page content" in error_msg:
+                    logger.warning(f"Неверный тип контента для {url}, отправка текстовой ссылки")
+                    await self.send_as_text(update, url, caption, user_info)
+                else:
+                    logger.error(f"Неизвестная ошибка BadRequest: {error_msg}")
+                    await self.send_as_text(update, url, caption, user_info)
+            except Exception as e:
+                logger.error(f"Общая ошибка при отправке документа: {str(e)}")
+                await self.send_as_text(update, url, caption, user_info)
 
     async def send_media(self, update: Update, key: Tuple[int, int], media_group: List):
         if not media_group:
@@ -1755,6 +1784,57 @@ class ImageBot:
             f"Время: 0с"
         )
         
+        # Рассчитываем квоты с учетом приоритета
+        total_weight = sum(SOURCE_WEIGHTS.values())
+        sources = {}
+        for src in SOURCE_PRIORITY:
+            weight = SOURCE_WEIGHTS[src]
+            # Квота = (вес источника / общий вес) * общее количество
+            quota = int((weight / total_weight) * count)
+            # Убедимся, что квота хотя бы 1 для источников с ненулевым весом
+            if quota == 0 and weight > 0:
+                quota = 1
+            sources[src] = {
+                "active": True, 
+                "found": 0, 
+                "status": "активен", 
+                "quota": quota,
+                "priority": SOURCE_PRIORITY.index(src)
+            }
+        
+        # Корректировка квот, чтобы сумма была равна count
+        total_quota = sum(data['quota'] for data in sources.values())
+        if total_quota < count:
+            # Распределяем оставшуюся квоту по приоритету
+            remaining = count - total_quota
+            for src in SOURCE_PRIORITY:
+                if remaining <= 0:
+                    break
+                if src in sources:
+                    sources[src]['quota'] += 1
+                    remaining -= 1
+        elif total_quota > count:
+            # Уменьшаем квоту для наименее приоритетных источников
+            remaining = total_quota - count
+            for src in reversed(SOURCE_PRIORITY):
+                if remaining <= 0:
+                    break
+                if src in sources:
+                    # Уменьшаем квоту, но не ниже 1
+                    reduce_amount = min(sources[src]['quota'], remaining)
+                    sources[src]['quota'] -= reduce_amount
+                    remaining -= reduce_amount
+        
+        # Дополнительная проверка: если сумма всё ещё не равна count
+        total_quota = sum(data['quota'] for data in sources.values())
+        if total_quota != count:
+            # Корректируем наиболее приоритетный источник
+            diff = count - total_quota
+            if diff > 0:
+                sources[SOURCE_PRIORITY[0]]['quota'] += diff
+            elif diff < 0:
+                sources[SOURCE_PRIORITY[-1]]['quota'] = max(0, sources[SOURCE_PRIORITY[-1]]['quota'] + diff)
+        
         session_data = {
             "tasks": [],
             "stop": False,
@@ -1766,14 +1846,7 @@ class ImageBot:
             "found": 0,
             "analyzed": 0,
             "source_type": "all",
-            "sources": {
-                'imgur5': {"active": True, "found": 0, "status": "активен", "quota": int(count * SOURCE_WEIGHTS['imgur5'] * 1.5)},
-                'imgur7': {"active": True, "found": 0, "status": "активен", "quota": int(count * SOURCE_WEIGHTS['imgur7'] * 1.5)},
-                'prnt': {"active": True, "found": 0, "status": "активен", "quota": int(count * SOURCE_WEIGHTS['prnt'] * 1.5)},
-                'pastenow': {"active": True, "found": 0, "status": "активен", "quota": int(count * SOURCE_WEIGHTS['pastenow'] * 1.5)},
-                'freeimage': {"active": True, "found": 0, "status": "активен", "quota": int(count * SOURCE_WEIGHTS['freeimage'] * 1.5)},
-                'kappa': {"active": True, "found": 0, "status": "активен", "quota": int(count * SOURCE_WEIGHTS['kappa'] * 1.5)}
-            },
+            "sources": sources,
             "user_info": user_info(update),
             "prev_quotas": {}
         }
@@ -1802,29 +1875,74 @@ class ImageBot:
 
     async def _search_all_sources(self, update: Update, key: Tuple[int, int], count: int):
         async def _recalculate_quotas(session_dict: dict):
-            total_remaining = count - session_dict['found']
+            total_remaining = session_dict['target_count'] - session_dict['found']
             if total_remaining <= 0:
                 return
 
-            active_sources = [src for src in session_dict['sources'] 
-                            if session_dict['sources'][src]['active'] and not self.is_source_disabled(src)]
-            total_weight = sum(SOURCE_WEIGHTS[src] for src in active_sources)
-            if total_weight == 0:
+            # Рассчитываем сколько "места" освободилось
+            freed_quota = 0
+            for src, data in session_dict['sources'].items():
+                if not data['active'] or data['status'] != "активен":
+                    # Неиспользованная квота: max(0, quota - found)
+                    unused = max(0, data['quota'] - data['found'])
+                    if unused > 0:
+                        freed_quota += unused
+
+            # Распределяем только освободившуюся квоту, но не более чем доступно
+            available_quota = min(freed_quota, total_remaining)
+            
+            # Собираем активные источники в порядке приоритета
+            active_sources = []
+            for src in SOURCE_PRIORITY:
+                if src in session_dict['sources']:
+                    data = session_dict['sources'][src]
+                    if data['active'] and data['status'] == "активен":
+                        active_sources.append((src, data['priority']))
+            
+            # Если нет активных источников, выходим
+            if not active_sources:
                 return
-
-            # Рассчитываем новые квоты с перераспределением
-            new_quotas = {}
-            for src in active_sources:
-                data = session_dict['sources'][src]
-                # Вычисляем новую квоту: уже найденное + доля от оставшегося
-                new_quota = data['found'] + int(total_remaining * (SOURCE_WEIGHTS[src] / total_weight))
-                # Ограничиваем сверху удвоенной начальной квотой
-                max_quota = int(count * SOURCE_WEIGHTS[src] * 2)
-                new_quotas[src] = min(new_quota, max_quota)
-
-            # Устанавливаем квоты
-            for src in active_sources:
-                session_dict['sources'][src]['quota'] = new_quotas[src]
+            
+            # Сортируем по приоритету (чем меньше индекс, тем выше приоритет)
+            active_sources.sort(key=lambda x: x[1])
+            
+            # Распределяем освободившуюся квоту пропорционально весу
+            total_active_weight = sum(SOURCE_WEIGHTS[src] for src, _ in active_sources)
+            if total_active_weight == 0:
+                return
+                
+            distributed = 0
+            for src, _ in active_sources:
+                if distributed >= available_quota:
+                    break
+                    
+                weight_ratio = SOURCE_WEIGHTS[src] / total_active_weight
+                additional = int(available_quota * weight_ratio)
+                if additional > 0:
+                    # Ограничение: не давать источнику больше чем осталось
+                    max_additional = total_remaining - session_dict['sources'][src]['found']
+                    actual_additional = min(additional, max_additional)
+                    if actual_additional > 0:
+                        session_dict['sources'][src]['quota'] += actual_additional
+                        distributed += actual_additional
+            
+            # Распределяем остаток
+            remainder = available_quota - distributed
+            if remainder > 0:
+                for src, _ in active_sources:
+                    if remainder <= 0:
+                        break
+                    # Ограничение: не давать источнику больше чем осталось
+                    max_additional = total_remaining - session_dict['sources'][src]['found']
+                    if max_additional > 0:
+                        actual_additional = min(1, max_additional)
+                        session_dict['sources'][src]['quota'] += actual_additional
+                        distributed += actual_additional
+                        remainder -= actual_additional
+            
+            # Логирование если остался нераспределённый остаток
+            if remainder > 0:
+                logger.warning(f"Остался нераспределённый остаток квоты: {remainder}")
 
         async def search_source(source_type: str):
             nonlocal session
@@ -1939,11 +2057,9 @@ class ImageBot:
             session = self.sessions[key]
             user_info_str = session.get("user_info", "System")
             
-            # Задаем порядок обработки источников
-            source_order = ['imgur5', 'freeimage', 'kappa', 'pastenow', 'prnt', 'imgur7']
-            
             tasks = []
-            for source_type in source_order:
+            # Запускаем задачи в порядке приоритета
+            for source_type in SOURCE_PRIORITY:
                 if source_type not in session["sources"]:
                     continue
                     
